@@ -1,6 +1,6 @@
 # jbo — JetBrains WSL File Navigation
 
-Open any file at a specific line in a JetBrains IDE directly from your WSL terminal — with clickable links in Windows Terminal and native hyperlinks in the JetBrains built-in terminal.
+Open any file at a specific line in a JetBrains IDE directly from your WSL terminal — with clickable links in Windows Terminal and native hyperlinks in the JetBrains built-in terminal. Works great with AI coding agents (Claude Code, Codex) that output `file:line` references.
 
 ```bash
 wso src/pages/Foo.ts:42          # open in WebStorm
@@ -61,6 +61,26 @@ echo "See $(ij_link src/Main.java:5)"
 |---|---|
 | JetBrains built-in | Outputs `/mnt/d/…/Foo.ts:42` — IDE auto-hyperlinks `path:line` natively |
 | Windows Terminal | Emits an OSC 8 hyperlink → `jbo://` protocol → opens IDE at the line |
+
+## AI Agent Integration
+
+If you use AI coding assistants in your terminal — [Claude Code](https://claude.ai/code), OpenAI Codex, or similar — jbo turns their file references into one-click IDE jumps.
+
+**JetBrains built-in terminal:** No setup needed. The IDE already auto-hyperlinks any `path:line` pattern, so every file reference an agent outputs is instantly clickable.
+
+**Windows Terminal:** Add the snippet below to your project's `CLAUDE.md` (or `AGENTS.md` / `GEMINI.md`) so the agent emits clickable OSC 8 hyperlinks via the jbo helpers:
+
+```markdown
+## File References
+This project uses [jbo](https://github.com/zeroarst/jbo) for IDE navigation.
+When running shell commands that reference a file at a specific line, wrap the
+reference with the appropriate link helper so it becomes a clickable link in
+Windows Terminal:
+
+    echo "See $(ws_link src/Foo.ts:42)"      # WebStorm
+    echo "See $(as_link app/Main.kt:10)"     # Android Studio
+    echo "See $(ij_link src/Main.java:5)"    # IntelliJ IDEA
+```
 
 ## How It Works
 
