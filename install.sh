@@ -12,8 +12,8 @@ warn()  { echo -e "${YELLOW}[jbo]${NC} $*" >&2; }
 error() { echo -e "${RED}[jbo]${NC} $*" >&2; }
 
 # ── detect LOCALAPPDATA ───────────────────────────────────────────────────────
-LOCALAPPDATA_WIN=$(powershell.exe -NoProfile -Command 'Write-Output $env:LOCALAPPDATA' 2>/dev/null | tr -d '\r')
-LOCALAPPDATA_WSL=$(wslpath "$LOCALAPPDATA_WIN")
+LOCALAPPDATA_WIN=$(powershell.exe -NoProfile -Command 'Write-Output $env:LOCALAPPDATA' </dev/null 2>/dev/null | tr -d '\r')
+LOCALAPPDATA_WSL=$(wslpath "$LOCALAPPDATA_WIN" </dev/null)
 
 # ── IDE discovery ─────────────────────────────────────────────────────────────
 find_ide() {
@@ -28,14 +28,14 @@ find_ide() {
             Where-Object { \$_.DisplayName -match '$pattern' } |
             Select-Object -ExpandProperty InstallLocation -First 1
         if (\$found) { Write-Output \$found }
-    " 2>/dev/null | tr -d '\r'
+    " </dev/null 2>/dev/null | tr -d '\r'
 }
 
 detect_exe() {
     local dir="$1" exe_name="$2"
     if [ -n "$dir" ]; then
         local wsl_dir
-        wsl_dir=$(wslpath "$dir" 2>/dev/null || true)
+        wsl_dir=$(wslpath "$dir" </dev/null 2>/dev/null || true)
         if [ -f "$wsl_dir/bin/$exe_name" ]; then
             echo "$dir\\bin\\$exe_name"
             return
@@ -46,7 +46,7 @@ detect_exe() {
         Get-ChildItem 'C:\','D:\' -Recurse -Depth 8 -ErrorAction SilentlyContinue |
         Where-Object { \$_.Name -eq '$exe_name' } |
         Select-Object -ExpandProperty FullName -First 1
-    " 2>/dev/null | tr -d '\r'
+    " </dev/null 2>/dev/null | tr -d '\r'
 }
 
 echo ""
@@ -131,10 +131,10 @@ sub "__IJ_EXE__"       "$IJ_EXE" "$LOCALAPPDATA_WSL/jbo-handler.ps1"
 # ── register jbo:// protocol ──────────────────────────────────────────────────
 info "Registering jbo:// protocol handler..."
 VBS_WIN="$LOCALAPPDATA_WIN\\jbo-handler.vbs"
-reg.exe add "HKCU\\Software\\Classes\\jbo"                   /ve /d "URL:JetBrains Open Protocol" /f >& /dev/null
-reg.exe add "HKCU\\Software\\Classes\\jbo"                   /v "URL Protocol" /d "" /f >& /dev/null
+reg.exe add "HKCU\\Software\\Classes\\jbo"                   /ve /d "URL:JetBrains Open Protocol" /f </dev/null >& /dev/null
+reg.exe add "HKCU\\Software\\Classes\\jbo"                   /v "URL Protocol" /d "" /f </dev/null >& /dev/null
 reg.exe add "HKCU\\Software\\Classes\\jbo\\shell\\open\\command" /ve \
-    /d "wscript.exe \"$VBS_WIN\" \"%1\"" /f >& /dev/null
+    /d "wscript.exe \"$VBS_WIN\" \"%1\"" /f </dev/null >& /dev/null
 
 # ── update RC files ───────────────────────────────────────────────────────────
 updated_any=false
