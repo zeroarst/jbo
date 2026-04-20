@@ -71,16 +71,24 @@ prompt_override() {
     local answer
     if [ -z "$current" ]; then
         warn "$name not found automatically."
-        printf "  Enter Windows path to %s exe (or leave blank to skip): " "$name" >&2
-        read -r answer </dev/tty
-        echo "$answer"
+        if [ -t 0 ]; then
+            printf "  Enter Windows path to %s exe (or leave blank to skip): " "$name" >&2
+            read -r answer
+            echo "$answer"
+        else
+            echo ""
+        fi
     else
-        printf "  %s: %s — correct? [Y/n] " "$name" "$current" >&2
-        read -r answer </dev/tty
-        case "$answer" in
-            [nN]*) printf "  Enter correct path: " >&2; read -r answer </dev/tty; echo "$answer";;
-            *)     echo "$current";;
-        esac
+        if [ -t 0 ]; then
+            printf "  %s: %s — correct? [Y/n] " "$name" "$current" >&2
+            read -r answer
+            case "$answer" in
+                [nN]*) printf "  Enter correct path: " >&2; read -r answer; echo "$answer";;
+                *)     echo "$current";;
+            esac
+        else
+            echo "$current"
+        fi
     fi
 }
 
