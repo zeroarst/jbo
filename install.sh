@@ -28,6 +28,7 @@ find_ide() {
             Where-Object { \$_.DisplayName -match '$pattern' } |
             Select-Object -ExpandProperty InstallLocation -First 1
         if (\$found) { Write-Output \$found }
+        exit 0
     " </dev/null 2>/dev/null | tr -d '\r'
 }
 
@@ -46,6 +47,7 @@ detect_exe() {
         Get-ChildItem 'C:\','D:\' -Recurse -Depth 8 -ErrorAction SilentlyContinue |
         Where-Object { \$_.Name -eq '$exe_name' } |
         Select-Object -ExpandProperty FullName -First 1
+        exit 0
     " </dev/null 2>/dev/null | tr -d '\r'
 }
 
