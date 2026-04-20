@@ -8,7 +8,7 @@ SOURCE_LINE='[ -f ~/.config/jbo/functions.sh ] && source ~/.config/jbo/functions
 # ── colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[jbo]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[jbo]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[jbo]${NC} $*" >&2; }
 error() { echo -e "${RED}[jbo]${NC} $*" >&2; }
 
 # ── detect LOCALAPPDATA ───────────────────────────────────────────────────────
@@ -71,14 +71,14 @@ prompt_override() {
     local answer
     if [ -z "$current" ]; then
         warn "$name not found automatically."
-        printf "  Enter Windows path to %s exe (or leave blank to skip): " "$name"
-        read -r answer
+        printf "  Enter Windows path to %s exe (or leave blank to skip): " "$name" >&2
+        read -r answer </dev/tty
         echo "$answer"
     else
-        printf "  %s: %s — correct? [Y/n] " "$name" "$current"
-        read -r answer
+        printf "  %s: %s — correct? [Y/n] " "$name" "$current" >&2
+        read -r answer </dev/tty
         case "$answer" in
-            [nN]*) printf "  Enter correct path: "; read -r answer; echo "$answer";;
+            [nN]*) printf "  Enter correct path: " >&2; read -r answer </dev/tty; echo "$answer";;
             *)     echo "$current";;
         esac
     fi
