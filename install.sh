@@ -127,7 +127,10 @@ fi
 # ── substitute placeholders ───────────────────────────────────────────────────
 sub() {
     local placeholder="$1" value="$2" file="$3"
-    [ -n "$value" ] && sed -i "s|${placeholder}|${value}|g" "$file"
+    [ -n "$value" ] || return 0
+    local escaped
+    escaped=$(printf '%s' "$value" | sed 's/[\\&]/\\&/g')
+    sed -i "s|${placeholder}|${escaped}|g" "$file"
 }
 
 sub "__WEBSTORM_EXE__" "$WS_EXE" "$INSTALL_DIR/functions.sh"
