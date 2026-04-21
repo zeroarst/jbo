@@ -1,7 +1,12 @@
 param([string]$Uri)
 Add-Type -AssemblyName System.Web
 $q = [System.Web.HttpUtility]::ParseQueryString(([Uri]$Uri).Query)
-$file = $q["file"] -replace '/', '\'
+$file = $q["file"]
+if ($file -match '^/mnt/([a-z])/(.*)') {
+    $file = $matches[1].ToUpper() + ':' + $matches[2] -replace '/', '\'
+} else {
+    $file = $file -replace '/', '\'
+}
 $line = $q["line"]
 $ide  = $q["ide"]
 
