@@ -12,9 +12,15 @@ if [ -d "$HOME/.config/jbo" ]; then
     info "Removed ~/.config/jbo"
 fi
 
+# Remove jbo-wrap binary
+if [ -f "$HOME/.local/bin/jbo-wrap" ]; then
+    rm -f "$HOME/.local/bin/jbo-wrap"
+    info "Removed ~/.local/bin/jbo-wrap"
+fi
+
 # Remove Windows handler files
-LOCALAPPDATA_WIN=$(powershell.exe -NoProfile -Command 'Write-Output $env:LOCALAPPDATA' 2>/dev/null | tr -d '\r')
-LOCALAPPDATA_WSL=$(wslpath "$LOCALAPPDATA_WIN")
+LOCALAPPDATA_WIN=$(powershell.exe -NoProfile -Command 'Write-Output $env:LOCALAPPDATA' </dev/null 2>/dev/null | tr -d '\r')
+LOCALAPPDATA_WSL=$(wslpath "$LOCALAPPDATA_WIN" </dev/null)
 for f in jbo-handler.vbs jbo-handler.ps1; do
     if [ -f "$LOCALAPPDATA_WSL/$f" ]; then
         rm -f "$LOCALAPPDATA_WSL/$f"
