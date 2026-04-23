@@ -99,9 +99,11 @@ AS_EXE=$(prompt_override  "Android Studio" "$AS_EXE")
 IJ_EXE=$(prompt_override  "IntelliJ IDEA"  "$IJ_EXE")
 
 # ── download templates ────────────────────────────────────────────────────────
+BIN_DIR="$HOME/.local/bin"
+
 echo ""
 info "Installing to $INSTALL_DIR ..."
-mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR" "$BIN_DIR"
 
 if command -v curl >/dev/null 2>&1; then
     fetch() { curl -fsSL "$1" -o "$2"; }
@@ -118,11 +120,14 @@ if [ -f "$SCRIPT_DIR/src/functions.sh" ]; then
     cp "$SCRIPT_DIR/src/functions.sh"    "$INSTALL_DIR/functions.sh"
     cp "$SCRIPT_DIR/src/jbo-handler.ps1" "$LOCALAPPDATA_WSL/jbo-handler.ps1"
     cp "$SCRIPT_DIR/src/jbo-handler.vbs" "$LOCALAPPDATA_WSL/jbo-handler.vbs"
+    cp "$SCRIPT_DIR/src/jbo-wrap"        "$BIN_DIR/jbo-wrap"
 else
     fetch "$REPO_URL/src/functions.sh"    "$INSTALL_DIR/functions.sh"
     fetch "$REPO_URL/src/jbo-handler.ps1" "$LOCALAPPDATA_WSL/jbo-handler.ps1"
     fetch "$REPO_URL/src/jbo-handler.vbs" "$LOCALAPPDATA_WSL/jbo-handler.vbs"
+    fetch "$REPO_URL/src/jbo-wrap"        "$BIN_DIR/jbo-wrap"
 fi
+chmod +x "$BIN_DIR/jbo-wrap"
 
 # ── substitute placeholders ───────────────────────────────────────────────────
 sub() {
@@ -168,8 +173,9 @@ echo "  Restart your terminal, or run:"
 echo "    source ~/.config/jbo/functions.sh"
 echo ""
 echo "  Usage:"
-echo "    wso src/Foo.ts:42          # open in WebStorm"
-echo "    aso app/src/Main.kt:10     # open in Android Studio"
-echo "    ijo src/Main.java:5        # open in IntelliJ"
-echo "    echo \"\$(ws_link src/Foo.ts:42)\"  # clickable link"
+echo "    wso src/Foo.ts:42                    # open in WebStorm"
+echo "    aso app/src/Main.kt:10               # open in Android Studio"
+echo "    ijo src/Main.java:5                  # open in IntelliJ"
+echo "    echo \"\$(ws_link src/Foo.ts:42)\"       # clickable link"
+echo "    jbo-wrap <command> [args...]          # auto-linkify path:line in output"
 echo ""
