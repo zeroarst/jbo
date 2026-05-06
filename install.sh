@@ -2,7 +2,9 @@
 set -euo pipefail
 
 REPO_URL="https://raw.githubusercontent.com/zeroarst/jbo/main"
+RELEASE_URL="https://github.com/zeroarst/jbo/releases/latest/download"
 INSTALL_DIR="$HOME/.config/jbo"
+BIN_DIR="$HOME/.local/bin"
 SOURCE_LINE='[ -f ~/.config/jbo/functions.sh ] && source ~/.config/jbo/functions.sh'
 
 # ── colours ──────────────────────────────────────────────────────────────────
@@ -11,9 +13,31 @@ info()  { echo -e "${GREEN}[jbo]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[jbo]${NC} $*" >&2; }
 error() { echo -e "${RED}[jbo]${NC} $*" >&2; }
 
+# ── detect environment ────────────────────────────────────────────────────────
+ENV_TYPE="unknown"
+if [ -n "${MSYSTEM:-}" ] || [ -n "${MINGW_PREFIX:-}" ]; then
+    ENV_TYPE="gitbash"
+elif grep -qi microsoft /proc/version 2>/dev/null; then
+    ENV_TYPE="wsl"
+fi
+
+# ── path helpers ──────────────────────────────────────────────────────────────
+_win_to_unix() {
+    if command -v wslpath >/dev/null 2>&1; then
+        wslpath -u "$1" 2>/dev/null || true
+    elif command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$1"
+    fi
+}
+
 # ── detect LOCALAPPDATA ───────────────────────────────────────────────────────
-LOCALAPPDATA_WIN=$(powershell.exe -NoProfile -Command 'Write-Output $env:LOCALAPPDATA' </dev/null 2>/dev/null | tr -d '\r')
-LOCALAPPDATA_WSL=$(wslpath "$LOCALAPPDATA_WIN" </dev/null)
+if [ "$ENV_TYPE" = "gitbash" ] && [ -n "${LOCALAPPDATA:-}" ]; then
+    LOCALAPPDATA_WIN="$LOCALAPPDATA"
+else
+    LOCALAPPDATA_WIN=$(powershell.exe -NoProfile -Command 'Write-Output $env:LOCALAPPDATA' </dev/null 2>/dev/null | tr -d '\r')
+fi
+JBO_WIN_DIR="$LOCALAPPDATA_WIN\\jbo"
+JBO_UNIX_DIR=$(_win_to_unix "$LOCALAPPDATA_WIN")/jbo
 
 # ── IDE discovery ─────────────────────────────────────────────────────────────
 find_ide() {
@@ -35,9 +59,9 @@ find_ide() {
 detect_exe() {
     local dir="$1" exe_name="$2"
     if [ -n "$dir" ]; then
-        local wsl_dir
-        wsl_dir=$(wslpath "$dir" </dev/null 2>/dev/null || true)
-        if [ -f "$wsl_dir/bin/$exe_name" ]; then
+        local unix_dir
+        unix_dir=$(_win_to_unix "$dir" 2>/dev/null || true)
+        if [ -f "$unix_dir/bin/$exe_name" ]; then
             echo "$dir\\bin\\$exe_name"
             return
         fi
@@ -98,12 +122,10 @@ WS_EXE=$(prompt_override  "WebStorm"       "$WS_EXE")
 AS_EXE=$(prompt_override  "Android Studio" "$AS_EXE")
 IJ_EXE=$(prompt_override  "IntelliJ IDEA"  "$IJ_EXE")
 
-# ── download templates ────────────────────────────────────────────────────────
-BIN_DIR="$HOME/.local/bin"
-
+# ── fetch helper ──────────────────────────────────────────────────────────────
 echo ""
 info "Installing to $INSTALL_DIR ..."
-mkdir -p "$INSTALL_DIR" "$BIN_DIR"
+mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$JBO_UNIX_DIR"
 
 if command -v curl >/dev/null 2>&1; then
     fetch() { curl -fsSL "$1" -o "$2"; }
@@ -114,22 +136,24 @@ else
     exit 1
 fi
 
-# If running from a local clone use local files, otherwise download
+# ── install shell files ───────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/src/functions.sh" ]; then
     cp "$SCRIPT_DIR/src/functions.sh"    "$INSTALL_DIR/functions.sh"
-    cp "$SCRIPT_DIR/src/jbo-handler.ps1" "$LOCALAPPDATA_WSL/jbo-handler.ps1"
-    cp "$SCRIPT_DIR/src/jbo-handler.vbs" "$LOCALAPPDATA_WSL/jbo-handler.vbs"
+    cp "$SCRIPT_DIR/src/jbo-wrap.py"     "$INSTALL_DIR/jbo-wrap.py"
+    cp "$SCRIPT_DIR/src/jbo-handler.ps1" "$JBO_UNIX_DIR/jbo-handler.ps1"
+    cp "$SCRIPT_DIR/src/jbo-handler.vbs" "$JBO_UNIX_DIR/jbo-handler.vbs"
     cp "$SCRIPT_DIR/src/jbo-wrap"        "$BIN_DIR/jbo-wrap"
 else
     fetch "$REPO_URL/src/functions.sh"    "$INSTALL_DIR/functions.sh"
-    fetch "$REPO_URL/src/jbo-handler.ps1" "$LOCALAPPDATA_WSL/jbo-handler.ps1"
-    fetch "$REPO_URL/src/jbo-handler.vbs" "$LOCALAPPDATA_WSL/jbo-handler.vbs"
+    fetch "$REPO_URL/src/jbo-wrap.py"     "$INSTALL_DIR/jbo-wrap.py"
+    fetch "$REPO_URL/src/jbo-handler.ps1" "$JBO_UNIX_DIR/jbo-handler.ps1"
+    fetch "$REPO_URL/src/jbo-handler.vbs" "$JBO_UNIX_DIR/jbo-handler.vbs"
     fetch "$REPO_URL/src/jbo-wrap"        "$BIN_DIR/jbo-wrap"
 fi
 chmod +x "$BIN_DIR/jbo-wrap"
 
-# ── substitute placeholders ───────────────────────────────────────────────────
+# ── substitute placeholders in functions.sh ───────────────────────────────────
 sub() {
     local placeholder="$1" value="$2" file="$3"
     [ -n "$value" ] || return 0
@@ -142,17 +166,40 @@ sub "__WEBSTORM_EXE__" "$WS_EXE" "$INSTALL_DIR/functions.sh"
 sub "__AS_EXE__"       "$AS_EXE" "$INSTALL_DIR/functions.sh"
 sub "__IJ_EXE__"       "$IJ_EXE" "$INSTALL_DIR/functions.sh"
 
-sub "__WEBSTORM_EXE__" "$WS_EXE" "$LOCALAPPDATA_WSL/jbo-handler.ps1"
-sub "__AS_EXE__"       "$AS_EXE" "$LOCALAPPDATA_WSL/jbo-handler.ps1"
-sub "__IJ_EXE__"       "$IJ_EXE" "$LOCALAPPDATA_WSL/jbo-handler.ps1"
+# ── write config.json (read by jbo-handler.exe and jbo-handler.ps1) ──────────
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+cat > "$JBO_UNIX_DIR/config.json" <<EOF
+{
+  "webstorm":      "$(json_escape "$WS_EXE")",
+  "androidstudio": "$(json_escape "$AS_EXE")",
+  "intellij":      "$(json_escape "$IJ_EXE")"
+}
+EOF
+
+# ── download jbo-handler.exe (fast native handler) ────────────────────────────
+info "Downloading jbo-handler.exe..."
+USE_EXE=false
+if fetch "$RELEASE_URL/jbo-handler.exe" "$JBO_UNIX_DIR/jbo-handler.exe" 2>/dev/null; then
+    USE_EXE=true
+    info "Using native handler (fast)."
+else
+    warn "jbo-handler.exe not available — using PowerShell fallback."
+fi
 
 # ── register jbo:// protocol ──────────────────────────────────────────────────
 info "Registering jbo:// protocol handler..."
-VBS_WIN="$LOCALAPPDATA_WIN\\jbo-handler.vbs"
-reg.exe add "HKCU\\Software\\Classes\\jbo"                   /ve /d "URL:JetBrains Open Protocol" /f </dev/null >& /dev/null
-reg.exe add "HKCU\\Software\\Classes\\jbo"                   /v "URL Protocol" /d "" /f </dev/null >& /dev/null
-reg.exe add "HKCU\\Software\\Classes\\jbo\\shell\\open\\command" /ve \
-    /d "wscript.exe \"$VBS_WIN\" \"%1\"" /f </dev/null >& /dev/null
+reg.exe add "HKCU\\Software\\Classes\\jbo"                       /ve /d "URL:JetBrains Open Protocol" /f </dev/null >& /dev/null || warn "reg.exe failed (jbo class) — you may need to run as admin"
+reg.exe add "HKCU\\Software\\Classes\\jbo"                       /v "URL Protocol" /d "" /f </dev/null >& /dev/null || true
+
+if [ "$USE_EXE" = true ]; then
+    EXE_WIN="$JBO_WIN_DIR\\jbo-handler.exe"
+    reg.exe add "HKCU\\Software\\Classes\\jbo\\shell\\open\\command" /ve \
+        /d "\"$EXE_WIN\" \"%1\"" /f </dev/null >& /dev/null || warn "reg.exe failed (command key)"
+else
+    VBS_WIN="$JBO_WIN_DIR\\jbo-handler.vbs"
+    reg.exe add "HKCU\\Software\\Classes\\jbo\\shell\\open\\command" /ve \
+        /d "wscript.exe \"$VBS_WIN\" \"%1\"" /f </dev/null >& /dev/null || warn "reg.exe failed (command key)"
+fi
 
 # ── update RC files ───────────────────────────────────────────────────────────
 updated_any=false

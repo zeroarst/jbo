@@ -1,81 +1,74 @@
-#!/usr/bin/env python3
-"""Wrap any command and add clickable OSC 8 jbo:// links to absolute path:line references."""
-import fcntl
-import os
-import pty
-import re
-import select
-import signal
-import sys
-import termios
-import tty
+#!/usr/bin/env bash
+# jbo-wrap: wrap a command and add clickable OSC 8 jbo:// links to path:line output.
+# PTY mode (WSL/Linux): full interactive support via Python.
+# Pipe mode (Git Bash / Windows): awk-based, no Python needed.
 
-IDE = os.environ.get('JBO_IDE', 'webstorm')
+IDE="${JBO_IDE:-webstorm}"
 
-# Only match absolute paths (/mnt/... or /home/...) with a file extension and line number.
-# Anchored on / so ANSI sequences (which never start with /) are never matched.
-_RE = re.compile(rb'(/[^\x00-\x20\x7f]*\.[a-zA-Z0-9]{1,10}):(\d+)')
+if [ $# -eq 0 ]; then
+    echo "Usage: jbo-wrap <command> [args...]" >&2
+    exit 1
+fi
 
-def _linkify(m):
-    path, line = m.group(1), m.group(2)
-    url = b'jbo://open?ide=' + IDE.encode() + b'&file=' + path + b'&line=' + line
-    return b'\x1b]8;;' + url + b'\x1b\\' + path + b':' + line + b'\x1b]8;;\x1b\\'
-
-def _sync_winsize(src, dst):
-    try:
-        fcntl.ioctl(dst, termios.TIOCSWINSZ,
-                    fcntl.ioctl(src, termios.TIOCGWINSZ, b'\x00' * 8))
-    except OSError:
-        pass
-
-def main():
-    args = sys.argv[1:]
-    if not args:
-        sys.exit('Usage: jbo-wrap <command> [args...]')
-
-    pid, master = pty.fork()
-    if pid == 0:
-        os.execvp(args[0], args)
-        sys.exit(1)
-
-    stdout_fd = sys.stdout.fileno()
-    stdin_fd  = sys.stdin.fileno()
-
-    _sync_winsize(stdout_fd, master)
-    signal.signal(signal.SIGWINCH, lambda *_: _sync_winsize(stdout_fd, master))
-
-    if not os.isatty(stdin_fd):
-        sys.exit('jbo-wrap: stdin must be a terminal')
-    old_attr = termios.tcgetattr(stdin_fd)
-    tty.setraw(stdin_fd)
-
-    try:
-        while True:
-            try:
-                rlist, _, _ = select.select([master, stdin_fd], [], [])
-            except (InterruptedError, ValueError):
+# ── find Python (skip Windows Store stubs) ───────────────────────────────────
+_PYTHON=""
+for _cmd in python3 python python3.exe python.exe; do
+    _path=$(command -v "$_cmd" 2>/dev/null) || continue
+    case "$_path" in */WindowsApps/*) continue ;; esac
+    if "$_cmd" -c "import sys" 2>/dev/null; then
+        _PYTHON="$_cmd"
+        break
+    fi
+done
+# Fallback: search LOCALAPPDATA\Programs\Python\ (common Windows install location)
+if [ -z "$_PYTHON" ] && [ -n "${LOCALAPPDATA:-}" ]; then
+    _la=$(cygpath -u "$LOCALAPPDATA" 2>/dev/null || true)
+    if [ -n "$_la" ]; then
+        for _py in "$_la"/Programs/Python/Python*/python.exe; do
+            [ -f "$_py" ] || continue
+            if "$_py" -c "import sys" 2>/dev/null; then
+                _PYTHON="$_py"
                 break
-            if master in rlist:
-                try:
-                    chunk = os.read(master, 65536)
-                except OSError:
-                    break
-                sys.stdout.buffer.write(_RE.sub(_linkify, chunk))
-                sys.stdout.buffer.flush()
-            if stdin_fd in rlist:
-                try:
-                    chunk = os.read(stdin_fd, 1024)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                os.write(master, chunk)
-    finally:
-        termios.tcsetattr(stdin_fd, termios.TCSANOW, old_attr)
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
+            fi
+        done
+    fi
+fi
 
-if __name__ == '__main__':
-    main()
+# ── PTY mode (Unix pty or Windows pywinpty) ───────────────────────────────────
+_JBO_WRAP_PY="${HOME}/.config/jbo/jbo-wrap.py"
+if [ -n "$_PYTHON" ] && [ -f "$_JBO_WRAP_PY" ]; then
+    if "$_PYTHON" -c "import pty, fcntl, termios" 2>/dev/null || \
+       "$_PYTHON" -c "import winpty" 2>/dev/null; then
+        exec "$_PYTHON" "$_JBO_WRAP_PY" "$@"
+    fi
+fi
+
+# ── Pipe mode (awk, no Python required) ───────────────────────────────────────
+"$@" 2>&1 | awk -v ide="$IDE" '
+{
+    line = $0
+    result = ""
+    while (1) {
+        if (match(line, /[A-Za-z]:[\/\\][^[:space:][:cntrl:]]*\.[a-zA-Z0-9]{1,10}:[0-9]+|\/[^[:space:][:cntrl:]]*\.[a-zA-Z0-9]{1,10}:[0-9]+/)) {
+            result = result substr(line, 1, RSTART - 1)
+            matched = substr(line, RSTART, RLENGTH)
+            line   = substr(line, RSTART + RLENGTH)
+            if (match(matched, /:[0-9]+$/)) {
+                path   = substr(matched, 1, RSTART - 1)
+                lineno = substr(matched, RSTART + 1)
+                gsub(/\\/, "/", path)
+                url = "jbo://open?ide=" ide "&file=" path "&line=" lineno
+                result = result "\033]8;;" url "\033\\" matched "\033]8;;\033\\"
+            } else {
+                result = result matched
+            }
+        } else {
+            result = result line
+            break
+        }
+    }
+    print result
+    fflush()
+}
+'
+exit "${PIPESTATUS[0]}"
