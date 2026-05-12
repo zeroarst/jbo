@@ -82,6 +82,45 @@ Windows Terminal:
     echo "See $(ij_link src/Main.java:5)"    # IntelliJ IDEA
 ```
 
+## Auto-linkify command output (`jbo-wrap`)
+
+`jbo-wrap` runs any command and rewrites file paths in its output into clickable OSC 8 hyperlinks — no manual `ws_link` calls, no agent-side prompt tweaks.
+
+```bash
+cd /your/project
+jbo-wrap claude              # Claude Code's file refs become clickable
+jbo-wrap npm test            # Jest/Vitest error stack paths clickable
+jbo-wrap make build          # Compiler errors clickable
+```
+
+**What it detects:**
+
+| Pattern | Example | Linkified? |
+|---|---|---|
+| Absolute Unix path with line | `/mnt/d/proj/src/foo.ts:42` | Always |
+| Absolute Windows path with line | `C:\proj\src\foo.go:7` | Always |
+| Relative path that **exists** on disk | `src/foo.js:42` | If file exists |
+| Relative path without `:line` | `package.json` | If file exists (opens at line 1) |
+| URLs | `https://example.com/foo.js` | Never |
+| Relative path that **does not exist** | `src/typo.js:42` | Never (passes through unchanged) |
+
+**Resolution base:** relative paths are resolved against the directory where you ran `jbo-wrap` (its startup CWD). For wrapping a long-running command like `jbo-wrap claude`, this means: `cd` into your project root first, then run `jbo-wrap claude`. All relative paths in the agent's output resolve against that root for the whole session.
+
+**Opt-out:** set `JBO_AUTODETECT=0` to disable relative-path detection and fall back to absolute-only behaviour:
+
+```bash
+JBO_AUTODETECT=0 jbo-wrap npm test
+```
+
+**Works through ANSI rendering:** Modern terminal apps (Claude Code, Codex, prompt-toolkit-based REPLs) often emit cursor-positioning escape sequences in place of literal spaces between tokens — e.g. `text\x1b[1Csrc/foo.js:9`. jbo-wrap treats CSI/OSC escapes as path-token boundaries and strips any pre-existing OSC 8 hyperlinks before adding its own, so paths in those tools' output linkify cleanly.
+
+**Debugging:** if a path isn't linkifying in some program's output, set `JBO_DEBUG_LOG=/tmp/jbo.log` before launching jbo-wrap. Every PTY read chunk is dumped as Python `repr()` so you can see the exact bytes upstream is sending.
+
+**Limitations:**
+
+- jbo-wrap holds the startup CWD for the whole run. It does not track `cd` inside a wrapped shell, so wrapping `zsh`/`bash` is not the intended use.
+- On Git Bash (no Python), jbo-wrap falls back to an AWK pipe that supports **absolute paths only** — the relative-path / existence-check feature requires Python.
+
 ## How It Works
 
 The core mechanism is `webstorm64.exe --line <n> <file>`. All JetBrains IDE CLIs support this flag and forward to an already-running instance.

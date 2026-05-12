@@ -44,6 +44,9 @@ if [ -n "$_PYTHON" ] && [ -f "$_JBO_WRAP_PY" ]; then
 fi
 
 # ── Pipe mode (awk, no Python required) ───────────────────────────────────────
+# Limitation: awk cannot cheaply check file existence, so this fallback only
+# handles absolute paths with a `:line` suffix (current regex). Relative-path
+# autodetection requires the Python branch above. Document this in the README.
 "$@" 2>&1 | awk -v ide="$IDE" '
 {
     line = $0
