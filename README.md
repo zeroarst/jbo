@@ -66,9 +66,18 @@ echo "See $(ij_link src/Main.java:5)"
 
 If you use AI coding assistants in your terminal — [Claude Code](https://claude.ai/code), OpenAI Codex, or similar — jbo turns their file references into one-click IDE jumps.
 
-**JetBrains built-in terminal:** No setup needed. The IDE already auto-hyperlinks any `path:line` pattern, so every file reference an agent outputs is instantly clickable.
+**Recommended: launch the agent through `jbo-wrap`.** No `CLAUDE.md` snippet, no agent-side prompting — the wrapper auto-detects paths in the agent's terminal output and converts them to clickable OSC 8 hyperlinks:
 
-**Windows Terminal:** Add the snippet below to your project's `CLAUDE.md` (or `AGENTS.md` / `GEMINI.md`) so the agent emits clickable OSC 8 hyperlinks via the jbo helpers:
+```bash
+cd /your/project
+jbo-wrap claude         # or:  jbo-wrap codex, jbo-wrap gemini, jbo-wrap aider
+```
+
+Any `src/foo.ts:42` (or `package.json`, or absolute path) the agent prints becomes clickable in Windows Terminal. See [Auto-linkify command output](#auto-linkify-command-output-jbo-wrap) below for the full behaviour.
+
+**JetBrains built-in terminal:** No setup needed regardless. The IDE already auto-hyperlinks any `path:line` pattern, so every file reference an agent outputs is instantly clickable.
+
+**Fallback (Windows Terminal without `jbo-wrap`):** if you run the agent directly without wrapping it, add the snippet below to your project's `CLAUDE.md` (or `AGENTS.md` / `GEMINI.md`) so the agent emits clickable OSC 8 hyperlinks via the jbo helpers:
 
 ```markdown
 ## File References
