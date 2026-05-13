@@ -73,6 +73,8 @@ cd /your/project
 jbo-wrap claude         # or:  jbo-wrap codex, jbo-wrap gemini, jbo-wrap aider
 ```
 
+The first time you run it in a project, jbo-wrap prompts you to pick which IDE its links should open in (auto-recommending based on project files — e.g. `package.json` → WebStorm, `AndroidManifest.xml` → Android Studio). The choice is remembered in `~/.config/jbo/projects.conf` so future runs are silent. See [Per-project IDE preference](#per-project-ide-preference) below.
+
 Any `src/foo.ts:42` (or `package.json`, or absolute path) the agent prints becomes clickable in Windows Terminal. See [Auto-linkify command output](#auto-linkify-command-output-jbo-wrap) below for the full behaviour.
 
 **JetBrains built-in terminal:** No setup needed regardless. The IDE already auto-hyperlinks any `path:line` pattern, so every file reference an agent outputs is instantly clickable.
@@ -124,6 +126,54 @@ JBO_AUTODETECT=0 jbo-wrap npm test
 **Works through ANSI rendering:** Modern terminal apps (Claude Code, Codex, prompt-toolkit-based REPLs) often emit cursor-positioning escape sequences in place of literal spaces between tokens — e.g. `text\x1b[1Csrc/foo.js:9`. jbo-wrap treats CSI/OSC escapes as path-token boundaries and strips any pre-existing OSC 8 hyperlinks before adding its own, so paths in those tools' output linkify cleanly.
 
 **Debugging:** if a path isn't linkifying in some program's output, set `JBO_DEBUG_LOG=/tmp/jbo.log` before launching jbo-wrap. Every PTY read chunk is dumped as Python `repr()` so you can see the exact bytes upstream is sending.
+
+### Per-project IDE preference
+
+`jbo-wrap` remembers which IDE each project's links should open in, so you don't have to set `JBO_IDE` globally or get the wrong one when a path is clicked.
+
+**First run in a project** — `jbo-wrap` walks up to the nearest `.git/` (or stays in CWD if there's none), shows an arrow-key picker pre-selecting an IDE based on project markers, and saves your choice:
+
+```
+jbo-wrap: choose IDE for this project
+  Project root: /mnt/d/repos/my-app
+  ↑/↓ move · Enter select · s skip · q/Esc quit
+
+  ▸ WebStorm   ← recommended
+    Android Studio
+    IntelliJ IDEA
+    Skip — use default this time, ask again next run
+```
+
+Keys: `↑/↓` (or `k/j`) to move, `Enter` to confirm, `s` to skip without saving, `q` or `Esc` to quit. If raw-mode stdin isn't available (rare — some CI shells), the picker degrades to a numeric prompt.
+
+**Subsequent runs** — silent passthrough; the saved IDE is used.
+
+**Auto-detect heuristic** (highest score wins, tie → WebStorm):
+
+| Marker file(s) | → IDE |
+|---|---|
+| `AndroidManifest.xml`, `local.properties`, `build.gradle` with `com.android` | Android Studio |
+| `pom.xml`, `build.sbt`, `*.iml`, plain `build.gradle*`/`settings.gradle*` | IntelliJ IDEA |
+| `package.json`, `tsconfig.json`, `angular.json`, `next.config.*`, `nuxt.config.*`, `vite.config.*`, `svelte.config.*` | WebStorm |
+
+**Managing the saved choice:**
+
+```bash
+jbo-wrap --show-config              # print the IDE set for the current project
+jbo-wrap --reconfigure claude       # re-prompt, then run the command
+jbo-wrap --validate                 # scan saved projects, offer to prune missing dirs
+```
+
+**Storage format** — `~/.config/jbo/projects.conf`, one project per line:
+
+```
+/mnt/d/repos/my-app=webstorm
+/mnt/d/repos/my-android-app=androidstudio
+```
+
+Safe to hand-edit if you prefer.
+
+**Non-interactive environments** (CI, piped stdin, no TTY): jbo-wrap skips the picker silently and falls back to `$JBO_IDE` (or `webstorm`). Set `JBO_SKIP_INIT=1` to force the same behaviour interactively.
 
 **Limitations:**
 
