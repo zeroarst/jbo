@@ -56,6 +56,45 @@ _CSI_RE = re.compile(rb'\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]')
 # nest with any pre-existing hyperlinks emitted upstream.
 _OSC_RE = re.compile(rb'\x1b\].*?(?:\x07|\x1b\\)', re.DOTALL)
 
+# Soft-wrap byte sequences a TUI renderer (e.g. Claude Code) inserts when it
+# hard-wraps a long path that exceeds terminal width. When flanked on both
+# sides by token-class bytes, we treat them as a no-op separator so the path
+# matches as one token.
+#
+# A wrap "zone" is centred on an anchor — either a bare LF (with one or more
+# leading `\r`, which is what raw-PTY CRLF translation produces) or a CSI
+# Cursor-Down (`\x1b[<n>B`) or CSI Next-Line (`\x1b[<n>E`). Around the anchor
+# we tolerate any combination of CR, other CSI escapes (colors, cursor-right,
+# clearing), literal whitespace, and box/block Unicode characters — those
+# make up the right-pad of the source row and the left-margin of the next
+# row. Claude Code's two observed word-wrap shapes both fit this:
+#   - streaming refresh:  `\r\x1b[<n>C\x1b[<n>B`
+#   - committed render:   `\r\r\n\x1b[<n>C`
+# Plain `\n` / `\r` standalone CAN match (zero fillers either side), but the
+# soft-wrap classifier only absorbs the match when both flanks are token
+# bytes and the trailing prefix isn't already a complete path token — so
+# newline-separated distinct paths still stay separate.
+_WRAP_RE = re.compile(
+    # pre-anchor: up to 256 "filler atoms" (CR, any CSI escape, space/tab,
+    # or a single 3-byte UTF-8 box/block char in U+2500..U+259F)
+    rb'(?:\r|\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]'
+    rb'|[ \t]|\xe2[\x94-\x96][\x80-\xbf]){0,256}'
+    # anchor: LF, CSI cursor-down, or CSI next-line
+    rb'(?:\n|\x1b\[\d*[BE])'
+    # post-anchor: up to 64 filler atoms (typical left-margin)
+    rb'(?:\r|\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]'
+    rb'|[ \t]|\xe2[\x94-\x96][\x80-\xbf]){0,64}'
+)
+
+# Trailing complete-token marker: a token run ending in `.ext` (or
+# `.ext:line`) looks like a finished path — so a wrap immediately after must
+# be separating distinct paths, not splitting one. Used to suppress soft-wrap
+# absorption. The `:line` suffix matters when a TUI renderer streams a list
+# of `path.ext:line` entries with cursor-down between them (the soft-wrap
+# classifier would otherwise sentinelise the inter-path bytes to `_`, which
+# sits in `\w` and breaks every subsequent path's regex lookbehind).
+_COMPLETE_EXT = re.compile(rb'\.[a-zA-Z0-9]{1,10}(?::\d+)?$')
+
 # Bytes that can be part of a path-shaped token. Matches the character class
 # used in `_FULL_RE`/`_LEGACY_RE`. We use this to find the chunk-boundary cut:
 # if a chunk ends in a run of these bytes, that tail might be the start of a
@@ -67,6 +106,34 @@ _TOKEN_BYTES = frozenset(
     + b'_./\\:-'
 )
 _MAX_BUFFER = 8192  # cap held-back bytes so a no-whitespace stream still flows
+
+# DEC-private-mode disables written before exit so the outer terminal recovers
+# even if the wrapped child died without emitting its own teardown. The set
+# below is safe to emit unconditionally — disabling an un-enabled mode is a
+# no-op on every terminal that implements them. `?1049l` is the exception:
+# some terminals interpret "leave alternate screen" as "switch back and clear
+# current view," which wipes whatever the child printed last (e.g. Claude's
+# `Resume this session with: claude --resume <uuid>` summary). It's emitted
+# from `_build_teardown` only when an unmatched `?1049h` was actually seen.
+_TERMINAL_RESET_SAFE = (
+    b'\x1b[<u'        # pop kitty keyboard stack
+    b'\x1b[=0;1u'     # clear kitty keyboard flags (belt + suspenders)
+    b'\x1b[?1004l'    # focus tracking off
+    b'\x1b[?2004l'    # bracketed paste off
+    b'\x1b[?1006l'    # SGR mouse off
+    b'\x1b[?1003l'    # any-event mouse tracking off
+    b'\x1b[?1002l'    # button-event mouse tracking off
+    b'\x1b[?1000l'    # X11 mouse tracking off
+)
+_CURSOR_VISIBLE = b'\x1b[?25h'
+_ALT_SCREEN_OFF = b'\x1b[?1049l'
+
+
+def _build_teardown(alt_screen_active: bool) -> bytes:
+    out = _TERMINAL_RESET_SAFE
+    if alt_screen_active:
+        out += _ALT_SCREEN_OFF
+    return out + _CURSOR_VISIBLE
 
 
 def _autodetect_enabled() -> bool:
@@ -98,6 +165,7 @@ class Linkifier:
         self._cache: dict[str, str | None] = {}
         self._regex = _FULL_RE if autodetect else _LEGACY_RE
         self._buffer = b''
+        self.alt_screen_active = False
 
     def process(self, chunk: bytes) -> bytes:
         """Feed a chunk. Returns linkified bytes for the leading portion that
@@ -107,17 +175,27 @@ class Linkifier:
         if not chunk:
             return b''
         _debug_log_chunk(chunk)
+        # Track alt-screen mode from bytes flowing through. Stand-alone CSI
+        # `?1049h/l` is the canonical form (multi-mode like `?1049;25h` is
+        # unusual and not handled here).
+        if b'\x1b[?1049h' in chunk:
+            self.alt_screen_active = True
+        if b'\x1b[?1049l' in chunk:
+            self.alt_screen_active = False
         data = self._buffer + chunk
         ansi_positions = self._ansi_positions(data)
-        cut = self._find_safe_cut(data, ansi_positions)
+        soft_wrap_bytes = self._classify_soft_wraps(data)
+        cut = self._find_safe_cut(data, ansi_positions, soft_wrap_bytes)
         if cut == 0:
             if len(data) > _MAX_BUFFER:
                 self._buffer = b''
-                return self._linkify(data, ansi_positions)
+                return self._linkify(data, ansi_positions, soft_wrap_bytes)
             self._buffer = data
             return b''
         self._buffer = data[cut:]
-        return self._linkify(data[:cut], ansi_positions)
+        leading_soft = {p for p in soft_wrap_bytes if p < cut}
+        leading_ansi = {p for p in ansi_positions if p < cut}
+        return self._linkify(data[:cut], leading_ansi, leading_soft)
 
     def flush(self) -> bytes:
         """Drain any held-back bytes. Call when the wrapped process has exited."""
@@ -125,7 +203,9 @@ class Linkifier:
             return b''
         data = self._buffer
         self._buffer = b''
-        return self._linkify(data, self._ansi_positions(data))
+        return self._linkify(data,
+                             self._ansi_positions(data),
+                             self._classify_soft_wraps(data))
 
     @staticmethod
     def _ansi_positions(data: bytes) -> set:
@@ -138,35 +218,113 @@ class Linkifier:
         return positions
 
     @staticmethod
-    def _find_safe_cut(data: bytes, ansi_positions: set) -> int:
-        """Index of the first byte of the trailing token-bytes run, treating
-        any byte inside an ANSI escape sequence as a hard boundary so that a
-        CSI's final letter (e.g. the `C` of `\\x1b[1C`) isn't mistaken for a
-        path-token character to hold back."""
+    def _classify_soft_wraps(data: bytes) -> set:
+        """Identify wrap sequences in `data` that should be absorbed into the
+        surrounding token (terminal width hard-wrap of a long path). A wrap is
+        soft when:
+
+          - flanked on both sides by token-class bytes,
+          - the trailing token-byte run before it does NOT already end with a
+            complete file extension (would mean prefix is itself a finished
+            path and the wrap is just separating distinct paths), AND
+          - the trailing token-byte run before it contains a slash — the
+            prefix must look like it's mid-path. Without this guard, prose
+            ending in a token byte followed by a newline-indented path would
+            get joined into a non-resolving token, suppressing the link that
+            should match the path alone.
+        """
+        soft = set()
+        for m in _WRAP_RE.finditer(data):
+            ws, we = m.start(), m.end()
+            prev_b = data[ws - 1] if ws > 0 else 0
+            next_b = data[we] if we < len(data) else 0
+            if prev_b not in _TOKEN_BYTES or next_b not in _TOKEN_BYTES:
+                continue
+            # Trailing token-byte run before the wrap.
+            i = ws
+            while i > 0 and data[i - 1] in _TOKEN_BYTES:
+                i -= 1
+            prefix = data[i:ws]
+            if _COMPLETE_EXT.search(prefix):
+                continue
+            if b'/' not in prefix and b'\\' not in prefix:
+                continue
+            soft.update(range(ws, we))
+        return soft
+
+    @staticmethod
+    def _find_safe_cut(data: bytes, ansi_positions: set, soft_wrap_bytes: set) -> int:
+        """Index of the first byte of the trailing held-back run. Token-class
+        bytes are always held back. ANSI escape bytes are a hard boundary
+        UNLESS they are part of a soft-wrap sequence (those get treated like
+        token bytes so a path split exactly at the chunk boundary still
+        linkifies once the tail arrives in the next chunk).
+
+        A wrap sequence at the *very end* of the data is also held back when
+        preceded by a token byte: at this point we don't yet know what comes
+        next, but the next chunk might continue a token across the wrap."""
+        # Also hold back any trailing wrap that's preceded by a token byte
+        # AND whose prefix looks path-like (contains `/` or `\\`) — its other
+        # flank is "to be determined" by the next chunk. Without the prefix
+        # check, plain prose ending in a letter + wrap + CSI tail (e.g.
+        # Claude Code's `Press Ctrl-C again to exit\x1b[39m   \r\x1b[1B...`
+        # frame) gets its visible tail held back, leaving the cursor parked
+        # mid-frame until the next chunk arrives.
+        trailing_wrap = set()
+        for m in _WRAP_RE.finditer(data):
+            ws, we = m.start(), m.end()
+            if we != len(data):
+                continue
+            prev_b = data[ws - 1] if ws > 0 else 0
+            if prev_b not in _TOKEN_BYTES:
+                continue
+            j = ws
+            while j > 0 and data[j - 1] in _TOKEN_BYTES:
+                j -= 1
+            prefix = data[j:ws]
+            if b'/' not in prefix and b'\\' not in prefix:
+                continue
+            if _COMPLETE_EXT.search(prefix):
+                continue
+            trailing_wrap.update(range(ws, we))
+        hold = soft_wrap_bytes | trailing_wrap
+
         i = len(data)
         while i > 0:
             c_pos = i - 1
+            if c_pos in hold:
+                i -= 1
+                continue
             if c_pos in ansi_positions:
                 return i
-            if data[c_pos] not in _TOKEN_BYTES:
-                return i
-            i -= 1
+            if data[c_pos] in _TOKEN_BYTES:
+                i -= 1
+                continue
+            return i
         return 0
 
-    def _linkify(self, chunk: bytes, ansi_positions: set) -> bytes:
+    def _linkify(self, chunk: bytes, ansi_positions: set, soft_wrap_bytes: set) -> bytes:
         """Apply the path regex to a 'logical view' of the chunk where ANSI
         bytes are NUL — this makes the regex treat ANSI sequences as token
         boundaries (so a path preceded by `\\x1b[1C` matches even though the
         literal byte before it is `C`, a word char). Output uses the original
         bytes so ANSI styling around paths is preserved. OSC 8 hyperlink
         wrappers in the input are stripped from the output to avoid nesting
-        with the jbo:// links we emit."""
+        with the jbo:// links we emit.
+
+        Soft-wrap byte positions are mapped to a token-class sentinel in the
+        logical view so a long path the renderer split at terminal-width
+        still matches as one token. The original wrap bytes stay in the
+        output (visual wrap preserved); the URL strips them out."""
         if not chunk:
             return b''
-        # Build the logical view: ANSI bytes → NUL.
+        # Build the logical view: ANSI bytes → NUL, then soft-wrap → '_'
+        # (soft_wrap_bytes overrides ANSI because some wraps are CSI escapes).
         logical = bytearray(chunk)
         for pos in ansi_positions:
             logical[pos] = 0
+        for pos in soft_wrap_bytes:
+            logical[pos] = ord('_')
         logical_bytes = bytes(logical)
 
         # Find any existing OSC 8 sequences — we strip them from the output
@@ -193,6 +351,59 @@ class Linkifier:
                 out.extend(chunk[i:end])
             return bytes(out)
 
+        def clean_token_bytes(s: int, e: int) -> bytes:
+            """Original bytes of group(1), minus any soft-wrap bytes we
+            sentinelised in the logical view."""
+            if not soft_wrap_bytes:
+                return chunk[s:e]
+            return bytes(chunk[i] for i in range(s, e) if i not in soft_wrap_bytes)
+
+        def emit_segmented_link(m_start: int, m_end: int, url: bytes) -> bytes:
+            """Walk chunk[m_start:m_end] position-by-position. Skip existing
+            OSC 8 spans entirely (they get stripped from output). Split the
+            visible content at soft-wrap byte boundaries and emit ONE OSC 8
+            segment per "content run" — wrap bytes pass through raw between
+            segments. This makes each visual row of a wrapped path an
+            independently-clickable hyperlink pointing at the same URL,
+            sidestepping terminals that don't honour multi-row OSC 8 hit
+            regions inside TUI renderers."""
+            seg_out = bytearray()
+            current = bytearray()
+            in_content = True  # True while collecting content bytes
+            i = m_start
+            while i < m_end:
+                # Skip any OSC 8 span entirely.
+                osc_skip = False
+                for s, e in osc8_spans:
+                    if s <= i < e:
+                        i = e
+                        osc_skip = True
+                        break
+                if osc_skip:
+                    continue
+                is_wrap = i in soft_wrap_bytes
+                if (not is_wrap) != in_content:
+                    # Switching modes — flush current buffer.
+                    if current:
+                        if in_content:
+                            seg_out.extend(b'\x1b]8;;' + url + b'\x1b\\')
+                            seg_out.extend(bytes(current))
+                            seg_out.extend(b'\x1b]8;;\x1b\\')
+                        else:
+                            seg_out.extend(bytes(current))
+                        current = bytearray()
+                    in_content = not is_wrap
+                current.append(chunk[i])
+                i += 1
+            if current:
+                if in_content:
+                    seg_out.extend(b'\x1b]8;;' + url + b'\x1b\\')
+                    seg_out.extend(bytes(current))
+                    seg_out.extend(b'\x1b]8;;\x1b\\')
+                else:
+                    seg_out.extend(bytes(current))
+            return bytes(seg_out)
+
         out = bytearray()
         last = 0
         for m in self._regex.finditer(logical_bytes):
@@ -204,18 +415,22 @@ class Linkifier:
                 # ANSI inside the token — don't try to linkify.
                 out.extend(match_orig)
             elif self._autodetect:
-                token = token_b.decode('utf-8', errors='replace')
+                clean_b = clean_token_bytes(m.start(1), m.end(1))
+                token = clean_b.decode('utf-8', errors='replace')
                 line_str = line_b.decode('ascii') if line_b else '1'
                 resolved = self._resolve_if_linkable(token)
                 if resolved is None:
                     out.extend(match_orig)
                 else:
-                    out.extend(self._build_osc8(match_orig, resolved, line_str))
+                    out.extend(emit_segmented_link(m.start(), m.end(),
+                                                   self._build_url(resolved, line_str)))
             else:
                 # legacy mode: always emit, never stat, group(2) is mandatory.
-                resolved = token_b.replace(b'\\', b'/').decode('utf-8', errors='replace')
+                clean_b = clean_token_bytes(m.start(1), m.end(1))
+                resolved = clean_b.replace(b'\\', b'/').decode('utf-8', errors='replace')
                 line_str = line_b.decode('ascii')
-                out.extend(self._build_osc8(match_orig, resolved, line_str))
+                out.extend(emit_segmented_link(m.start(), m.end(),
+                                               self._build_url(resolved, line_str)))
             last = m.end()
         out.extend(slice_skipping_osc8(last, len(chunk)))
         return bytes(out)
@@ -240,13 +455,12 @@ class Linkifier:
         self._cache[token] = result
         return result
 
-    def _build_osc8(self, display: bytes, resolved_path: str, line: str) -> bytes:
-        url = (
+    def _build_url(self, resolved_path: str, line: str) -> bytes:
+        return (
             b'jbo://open?ide=' + self._ide_b
             + b'&file=' + quote(resolved_path, safe='/:').encode('utf-8')
             + b'&line=' + line.encode('ascii')
         )
-        return b'\x1b]8;;' + url + b'\x1b\\' + display + b'\x1b]8;;\x1b\\'
 
 
 # ── PTY runners ──────────────────────────────────────────────────────────────
@@ -305,7 +519,8 @@ def _run_pty(args, linkifier: Linkifier):
         tail = linkifier.flush()
         if tail:
             sys.stdout.buffer.write(tail)
-            sys.stdout.buffer.flush()
+        sys.stdout.buffer.write(_build_teardown(linkifier.alt_screen_active))
+        sys.stdout.buffer.flush()
         termios.tcsetattr(stdin_fd, termios.TCSANOW, old_attr)
         try:
             os.waitpid(pid, 0)
@@ -386,7 +601,8 @@ def _run_winpty(args, linkifier: Linkifier):
     tail = linkifier.flush()
     if tail:
         sys.stdout.buffer.write(tail)
-        sys.stdout.buffer.flush()
+    sys.stdout.buffer.write(_build_teardown(linkifier.alt_screen_active))
+    sys.stdout.buffer.flush()
     try:
         proc.wait()
     except Exception:
