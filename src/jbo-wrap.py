@@ -107,6 +107,17 @@ _TOKEN_BYTES = frozenset(
 )
 _MAX_BUFFER = 8192  # cap held-back bytes so a no-whitespace stream still flows
 
+# Escape introducers whose sequences run until a String Terminator (ESC \ or
+# BEL): OSC, DCS, SOS, PM, APC. Used to spot a sequence that has started but
+# not yet finished at the tail of a chunk.
+_ESC_ST_INTRODUCERS = frozenset(b']PX^_')
+_MAX_ESC_TAIL = 4096  # cap the incomplete-escape lookback; OSC 8 URLs get long
+
+# OSC 8 hyperlink with its URI captured: `ESC ] 8 ; <params> ; <uri> ST`. A
+# non-empty URI opens a link, an empty one closes it. Matches upstream forms
+# carrying params (`id=…`) as well as the empty-param form jbo-wrap emits.
+_OSC8_STATE_RE = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)(?:\x07|\x1b\\)')
+
 # DEC-private-mode disables written before exit so the outer terminal recovers
 # even if the wrapped child died without emitting its own teardown. The set
 # below is safe to emit unconditionally — disabling an un-enabled mode is a
@@ -127,10 +138,15 @@ _TERMINAL_RESET_SAFE = (
 )
 _CURSOR_VISIBLE = b'\x1b[?25h'
 _ALT_SCREEN_OFF = b'\x1b[?1049l'
+_OSC8_CLOSE = b'\x1b]8;;\x1b\\'
 
 
-def _build_teardown(alt_screen_active: bool) -> bytes:
-    out = _TERMINAL_RESET_SAFE
+def _build_teardown(alt_screen_active: bool, osc8_open: bool = False) -> bytes:
+    # Close a dangling hyperlink first — an OSC 8 left open makes the terminal
+    # underline (and linkify) every cell drawn afterwards, outliving the child.
+    # Nothing should reach here with one open; this is the last line of defence.
+    out = _OSC8_CLOSE if osc8_open else b''
+    out += _TERMINAL_RESET_SAFE
     if alt_screen_active:
         out += _ALT_SCREEN_OFF
     return out + _CURSOR_VISIBLE
@@ -166,6 +182,7 @@ class Linkifier:
         self._regex = _FULL_RE if autodetect else _LEGACY_RE
         self._buffer = b''
         self.alt_screen_active = False
+        self.osc8_open = False
 
     def process(self, chunk: bytes) -> bytes:
         """Feed a chunk. Returns linkified bytes for the leading portion that
@@ -175,27 +192,28 @@ class Linkifier:
         if not chunk:
             return b''
         _debug_log_chunk(chunk)
-        # Track alt-screen mode from bytes flowing through. Stand-alone CSI
-        # `?1049h/l` is the canonical form (multi-mode like `?1049;25h` is
-        # unusual and not handled here).
-        if b'\x1b[?1049h' in chunk:
-            self.alt_screen_active = True
-        if b'\x1b[?1049l' in chunk:
-            self.alt_screen_active = False
         data = self._buffer + chunk
         ansi_positions = self._ansi_positions(data)
         soft_wrap_bytes = self._classify_soft_wraps(data)
         cut = self._find_safe_cut(data, ansi_positions, soft_wrap_bytes)
+        # Never emit a half-arrived escape sequence. Its terminator is what
+        # makes it recognisable as an escape at all, so emitting the front half
+        # means the OSC 8 stripping in `_linkify` misses it while stripping its
+        # partner that arrives intact later — leaving the terminal with a
+        # hyperlink opened and never closed, underlining everything after it.
+        esc = self._incomplete_escape_start(data, ansi_positions)
+        if esc is not None:
+            cut = min(cut, esc)
         if cut == 0:
             if len(data) > _MAX_BUFFER:
                 self._buffer = b''
-                return self._linkify(data, ansi_positions, soft_wrap_bytes)
+                return self._emit(data, ansi_positions, soft_wrap_bytes)
             self._buffer = data
             return b''
         self._buffer = data[cut:]
         leading_soft = {p for p in soft_wrap_bytes if p < cut}
         leading_ansi = {p for p in ansi_positions if p < cut}
-        return self._linkify(data[:cut], leading_ansi, leading_soft)
+        return self._emit(data[:cut], leading_ansi, leading_soft)
 
     def flush(self) -> bytes:
         """Drain any held-back bytes. Call when the wrapped process has exited."""
@@ -203,9 +221,34 @@ class Linkifier:
             return b''
         data = self._buffer
         self._buffer = b''
-        return self._linkify(data,
-                             self._ansi_positions(data),
-                             self._classify_soft_wraps(data))
+        return self._emit(data,
+                          self._ansi_positions(data),
+                          self._classify_soft_wraps(data))
+
+    def _emit(self, data: bytes, ansi_positions: set, soft_wrap_bytes: set) -> bytes:
+        """Linkify `data` and update terminal-state tracking. Every byte reaches
+        the terminal through here exactly once, so state derived here can't
+        double-count a sequence that was held back across chunks."""
+        self._track_alt_screen(data)
+        out = self._linkify(data, ansi_positions, soft_wrap_bytes)
+        self._track_osc8(out)
+        return out
+
+    def _track_alt_screen(self, data: bytes) -> None:
+        """Alt-screen mode from the emitted bytes. Stand-alone CSI `?1049h/l` is
+        the canonical form (multi-mode like `?1049;25h` is unusual and not
+        handled here). Last occurrence wins — one slice can carry both."""
+        h = data.rfind(b'\x1b[?1049h')
+        l = data.rfind(b'\x1b[?1049l')
+        if h != -1 or l != -1:
+            self.alt_screen_active = h > l
+
+    def _track_osc8(self, out: bytes) -> None:
+        """Hyperlink state from the bytes we hand to the terminal. OSC 8 does
+        not nest — a new URI replaces the current one — so this is a flag, not a
+        depth. Read at teardown to close a link nothing else closed."""
+        for m in _OSC8_STATE_RE.finditer(out):
+            self.osc8_open = bool(m.group(1))
 
     @staticmethod
     def _ansi_positions(data: bytes) -> set:
@@ -216,6 +259,37 @@ class Linkifier:
         for m in _OSC_RE.finditer(data):
             positions.update(range(m.start(), m.end()))
         return positions
+
+    @staticmethod
+    def _incomplete_escape_start(data: bytes, ansi_positions: set):
+        """Index where a trailing, not-yet-complete escape sequence begins, or
+        None if `data` ends cleanly.
+
+        Scans FORWARD from the lookback limit so an unterminated OSC is reported
+        at its introducer rather than at some later ESC inside it. Reporting the
+        later one would leave `\\x1b]8;;<uri>` already emitted, and the URI text
+        — which often contains a real file path — would then be linkified as if
+        it were prose, nesting a link inside a link.
+
+        An ESC covered by `ansi_positions` belongs to a complete CSI/OSC match
+        and is skipped. Complete two-byte escapes (including ST, `ESC \\`) are
+        stepped over; neither regex matches those, so they'd otherwise look
+        unterminated forever.
+        """
+        i = max(0, len(data) - _MAX_ESC_TAIL)
+        while i < len(data):
+            if data[i] == 0x1b and i not in ansi_positions:
+                nxt = data[i + 1] if i + 1 < len(data) else None
+                if nxt is None:                 # bare trailing ESC
+                    return i
+                if nxt == 0x5b:                 # '[' — CSI without its final byte
+                    return i
+                if nxt in _ESC_ST_INTRODUCERS:  # OSC/DCS/… without its ST
+                    return i
+                i += 2                          # complete two-byte escape
+                continue
+            i += 1
+        return None
 
     @staticmethod
     def _classify_soft_wraps(data: bytes) -> set:
@@ -482,7 +556,8 @@ def _run_pty(args, linkifier: Linkifier):
 
     pid, master = pty.fork()
     if pid == 0:
-        os.execvp(args[0], args)
+        shell = os.environ.get('SHELL', '/bin/bash')
+        os.execvp(shell, [shell, '-i', '-c', 'exec "$@"', shell] + list(args))
         sys.exit(1)
 
     stdout_fd, stdin_fd = sys.stdout.fileno(), sys.stdin.fileno()
@@ -519,7 +594,8 @@ def _run_pty(args, linkifier: Linkifier):
         tail = linkifier.flush()
         if tail:
             sys.stdout.buffer.write(tail)
-        sys.stdout.buffer.write(_build_teardown(linkifier.alt_screen_active))
+        sys.stdout.buffer.write(_build_teardown(linkifier.alt_screen_active,
+                                                linkifier.osc8_open))
         sys.stdout.buffer.flush()
         termios.tcsetattr(stdin_fd, termios.TCSANOW, old_attr)
         try:
@@ -601,7 +677,8 @@ def _run_winpty(args, linkifier: Linkifier):
     tail = linkifier.flush()
     if tail:
         sys.stdout.buffer.write(tail)
-    sys.stdout.buffer.write(_build_teardown(linkifier.alt_screen_active))
+    sys.stdout.buffer.write(_build_teardown(linkifier.alt_screen_active,
+                                            linkifier.osc8_open))
     sys.stdout.buffer.flush()
     try:
         proc.wait()

@@ -4,6 +4,7 @@ The source file uses a hyphen (src/jbo-wrap.py), so we load it via importlib.
 """
 import importlib.util
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -669,6 +670,164 @@ class TestEdgeCases(_Fixture):
         out = self.run_through(self.link(),b'connect to 127.0.0.1 please')
         # 127.0.0.1 doesn't exist as a file → no link
         self.assertNotIn(b'\x1b]8;;', out)
+
+
+class TestSplitEscapeSequences(_Fixture):
+    """Regression: an escape sequence split across two PTY reads must be held
+    back until its terminator arrives.
+
+    `_OSC_RE` / `_CSI_RE` only match COMPLETE sequences, so a half-arrived one
+    is invisible to them. Emitting the front half meant the OSC 8 stripping in
+    `_linkify` missed an upstream hyperlink's opener while still stripping the
+    closer that arrived intact in a later chunk — leaving the terminal with a
+    link opened and never closed, which underlines and linkifies every cell
+    drawn afterwards for the rest of the session.
+
+    Large terminals triggered this constantly: wide redraw frames overflow a
+    single `os.read(master, 65536)` far more often, so splits land mid-sequence.
+    """
+
+    @staticmethod
+    def _osc8_counts(out):
+        """(opens, closes) of OSC 8 sequences in `out`. A non-empty URI opens a
+        hyperlink, an empty one closes it."""
+        opens = len(re.findall(rb'\x1b\]8;[^;\x07\x1b]*;[^\x07\x1b]+(?:\x07|\x1b\\)', out))
+        closes = len(re.findall(rb'\x1b\]8;[^;\x07\x1b]*;(?:\x07|\x1b\\)', out))
+        return opens, closes
+
+    def _feed(self, *chunks):
+        link = self.link()
+        out = b''.join(link.process(c) for c in chunks) + link.flush()
+        return link, out
+
+    def test_osc8_opener_split_across_chunks_stays_balanced(self):
+        # THE reported bug: everything after the split rendered underlined.
+        _, out = self._feed(b'hello \x1b]8;;https://exa',
+                            b'mple.com\x1b\\link text\x1b]8;;\x1b\\ tail\n')
+        opens, closes = self._osc8_counts(out)
+        self.assertEqual(opens, closes)
+        # Upstream link is stripped whole, exactly as in the unsplit case.
+        self.assertEqual(out, b'hello link text tail\n')
+
+    def test_osc8_split_immediately_after_introducer(self):
+        _, out = self._feed(b'hello \x1b]',
+                            b'8;;https://example.com\x1b\\link text\x1b]8;;\x1b\\ tail\n')
+        opens, closes = self._osc8_counts(out)
+        self.assertEqual(opens, closes)
+        self.assertEqual(out, b'hello link text tail\n')
+
+    def test_unsplit_control_matches_split_output(self):
+        whole = b'hello \x1b]8;;https://example.com\x1b\\link text\x1b]8;;\x1b\\ tail\n'
+        _, ref = self._feed(whole)
+        _, split = self._feed(whole[:22], whole[22:])
+        self.assertEqual(split, ref)
+
+    def test_path_inside_split_url_is_not_linkified(self):
+        # The held-back introducer must be the OSC's, not some later ESC inside
+        # it — otherwise `\x1b]8;;<uri>` is already emitted and the real path in
+        # the URI gets linkified as prose, nesting a link inside a link.
+        real = (self.cwd / 'src' / 'foo.js')
+        uri = b'file://' + str(real).encode().replace(b'\\', b'/')
+        _, out = self._feed(b'see \x1b]8;;' + uri[:-3], uri[-3:] + b'\x1b\\foo\x1b]8;;\x1b\\\n')
+        self.assertNotIn(b'jbo://open', out)
+        self.assertEqual(out, b'see foo\n')
+
+    def test_alt_screen_enter_split_across_chunks(self):
+        # A split `\x1b[?1049h` used to go unnoticed, so _build_teardown omitted
+        # `\x1b[?1049l` and the terminal was left in the alternate screen.
+        link = self.link()
+        link.process(b'\x1b[?10')
+        link.process(b'49h')
+        self.assertTrue(link.alt_screen_active)
+
+    def test_alt_screen_leave_split_across_chunks(self):
+        link = self.link()
+        link.process(b'\x1b[?1049h')
+        link.process(b'\x1b[?1049')
+        link.process(b'l')
+        self.assertFalse(link.alt_screen_active)
+
+    def test_split_csi_before_path_still_linkifies(self):
+        # `\x1b[1C` split across chunks used to leave `C` as the literal byte
+        # before the path, so the regex lookbehind refused the match and the
+        # path silently stopped being clickable.
+        rel = b'src/foo.js:3'
+        _, out = self._feed(b'x \x1b[1', b'C' + rel + b' y\n')
+        self.assertIn(b'\x1b]8;;jbo://open', out)
+        self.assertIn(b'&line=3', out)
+        self.assertIn(rel, out)
+
+    def test_bare_trailing_esc_held_then_completed(self):
+        link = self.link()
+        self.assertEqual(link.process(b'text\x1b'), b'text')
+        out = link.process(b'[?1049h') + link.flush()
+        self.assertEqual(out, b'\x1b[?1049h')
+        self.assertTrue(link.alt_screen_active)
+
+    def test_lone_st_without_opener_passes_through(self):
+        # ST whose introducer was emitted in an earlier session/chunk must not
+        # be mistaken for an unterminated sequence and held back forever.
+        _, out = self._feed(b'\x1b\\tail\n')
+        self.assertEqual(out, b'\x1b\\tail\n')
+
+    def test_unterminated_osc_does_not_stall_stream(self):
+        # A never-terminated sequence must still drain via the buffer cap,
+        # otherwise a malformed stream would freeze the terminal.
+        link = self.link()
+        out = link.process(b'\x1b]8;;' + b'u' * (jbo_wrap._MAX_BUFFER + 100))
+        out += link.flush()
+        self.assertGreater(len(out), jbo_wrap._MAX_BUFFER)
+
+    def test_teardown_reached_with_no_link_left_open(self):
+        # End-to-end: the split stream that used to strand a hyperlink now
+        # leaves the linkifier with nothing open, so teardown stays clean.
+        link, _ = self._feed(b'a \x1b]8;;https://exa',
+                             b'mple.com\x1b\\t\x1b]8;;\x1b\\ b\n')
+        self.assertFalse(link.osc8_open)
+        self.assertNotIn(b'\x1b]8;;',
+                         jbo_wrap._build_teardown(False, link.osc8_open))
+
+
+class TestOsc8SafetyNet(_Fixture):
+    """Last line of defence: if a hyperlink is somehow still open when the child
+    exits, close it in the teardown. Nothing should reach here with one open
+    once split sequences are held back — this exists so an unforeseen edge case
+    can never again leave the whole terminal underlined."""
+
+    def test_initial_state_is_closed(self):
+        self.assertFalse(self.link().osc8_open)
+
+    def test_emitted_link_opens_then_closes(self):
+        link = self.link()
+        out = link.process(b'see src/foo.js:42 ') + link.flush()
+        self.assertIn(b'\x1b]8;;jbo://open', out)
+        self.assertFalse(link.osc8_open)
+
+    def test_dangling_open_is_tracked(self):
+        link = self.link()
+        link._track_osc8(b'\x1b]8;;https://example.com\x1b\\text')
+        self.assertTrue(link.osc8_open)
+
+    def test_upstream_params_form_is_tracked(self):
+        # Terminals may emit `ESC ] 8 ; id=xyz ; uri ST`.
+        link = self.link()
+        link._track_osc8(b'\x1b]8;id=xyz;https://example.com\x1b\\text')
+        self.assertTrue(link.osc8_open)
+        link._track_osc8(b'\x1b]8;id=xyz;\x1b\\')
+        self.assertFalse(link.osc8_open)
+
+    def test_teardown_closes_dangling_link(self):
+        out = jbo_wrap._build_teardown(False, osc8_open=True)
+        self.assertIn(b'\x1b]8;;\x1b\\', out)
+        # Close first, before the mode resets, so nothing is drawn underlined.
+        self.assertLess(out.index(b'\x1b]8;;\x1b\\'), out.index(b'\x1b[?1004l'))
+
+    def test_teardown_emits_no_stray_close_when_balanced(self):
+        self.assertNotIn(b'\x1b]8;;', jbo_wrap._build_teardown(False, osc8_open=False))
+
+    def test_teardown_default_keeps_existing_callers_working(self):
+        self.assertEqual(jbo_wrap._build_teardown(False),
+                         jbo_wrap._build_teardown(False, False))
 
 
 if __name__ == '__main__':
