@@ -140,6 +140,26 @@ _CURSOR_VISIBLE = b'\x1b[?25h'
 _ALT_SCREEN_OFF = b'\x1b[?1049l'
 _OSC8_CLOSE = b'\x1b]8;;\x1b\\'
 
+# Synchronized output (DECSET 2026). A renderer brackets each frame in
+# BSU…ESU so the terminal presents it atomically instead of showing a
+# half-drawn screen. Claude Code wraps EVERY frame this way.
+#
+# This interacts badly with holding bytes back: a URL (or any path-shaped
+# run) is entirely token-class bytes, so when a PTY read boundary lands at
+# its end `_find_safe_cut` wants to withhold the whole run — including the
+# frame's closing ESU. The terminal then buffers a frame that never
+# completes and draws NOTHING until some later chunk happens to flush it.
+# Observed as: paste a URL → input looks empty; press any key → it appears.
+# So while a frame we emitted is still open, we never hold anything back.
+_SYNC_BEGIN = b'\x1b[?2026h'
+_SYNC_END = b'\x1b[?2026l'
+
+# Idle gap after which held-back bytes are flushed anyway. Belt-and-braces
+# for renderers that don't use synchronized output: without it, visible text
+# ending in token bytes waits on a chunk that may never come. Far longer
+# than any intra-frame gap, far below human-perceptible latency.
+_PENDING_FLUSH_SEC = 0.05
+
 
 def _build_teardown(alt_screen_active: bool, osc8_open: bool = False) -> bytes:
     # Close a dangling hyperlink first — an OSC 8 left open makes the terminal
@@ -183,6 +203,14 @@ class Linkifier:
         self._buffer = b''
         self.alt_screen_active = False
         self.osc8_open = False
+        self.sync_open = False
+        self._tail_mid_token = False
+
+    @property
+    def pending(self) -> bool:
+        """True while bytes are held back awaiting the next chunk. The PTY loop
+        watches this so it can `flush()` on an idle timeout."""
+        return bool(self._buffer)
 
     def process(self, chunk: bytes) -> bytes:
         """Feed a chunk. Returns linkified bytes for the leading portion that
@@ -204,6 +232,13 @@ class Linkifier:
         esc = self._incomplete_escape_start(data, ansi_positions)
         if esc is not None:
             cut = min(cut, esc)
+        # Holding bytes back is only safe between frames. If emitting just
+        # `data[:cut]` would leave a synchronized-output frame open, the
+        # terminal parks the whole frame off-screen until we send the ESU —
+        # so emit everything and let the path matching miss instead. A
+        # missed link is invisible; a stalled frame looks like a broken UI.
+        if cut < len(data) and self._sync_state_after(self.sync_open, data[:cut]):
+            cut = len(data)
         if cut == 0:
             if len(data) > _MAX_BUFFER:
                 self._buffer = b''
@@ -230,9 +265,28 @@ class Linkifier:
         the terminal through here exactly once, so state derived here can't
         double-count a sequence that was held back across chunks."""
         self._track_alt_screen(data)
-        out = self._linkify(data, ansi_positions, soft_wrap_bytes)
+        out = self._linkify(data, ansi_positions, soft_wrap_bytes,
+                            guard=self._tail_mid_token)
+        # Did this slice end mid-token? Normally the cut lands on a non-token
+        # byte and it can't — but a sync-frame flush emits regardless, so the
+        # next chunk may begin inside a path (or a URL). Judged on the logical
+        # view: an ANSI final byte like `m` is a token byte by value only.
+        self._tail_mid_token = bool(data) and (
+            len(data) - 1 not in ansi_positions and data[-1] in _TOKEN_BYTES
+        )
         self._track_osc8(out)
+        self.sync_open = self._sync_state_after(self.sync_open, out)
         return out
+
+    @staticmethod
+    def _sync_state_after(current: bool, data: bytes) -> bool:
+        """Synchronized-output state once `data` has been emitted. BSU/ESU do
+        not nest, so this is a flag, not a depth — last occurrence wins."""
+        h = data.rfind(_SYNC_BEGIN)
+        l = data.rfind(_SYNC_END)
+        if h == -1 and l == -1:
+            return current
+        return h > l
 
     def _track_alt_screen(self, data: bytes) -> None:
         """Alt-screen mode from the emitted bytes. Stand-alone CSI `?1049h/l` is
@@ -377,7 +431,8 @@ class Linkifier:
             return i
         return 0
 
-    def _linkify(self, chunk: bytes, ansi_positions: set, soft_wrap_bytes: set) -> bytes:
+    def _linkify(self, chunk: bytes, ansi_positions: set, soft_wrap_bytes: set,
+                 guard: bool = False) -> bytes:
         """Apply the path regex to a 'logical view' of the chunk where ANSI
         bytes are NUL — this makes the regex treat ANSI sequences as token
         boundaries (so a path preceded by `\\x1b[1C` matches even though the
@@ -399,7 +454,18 @@ class Linkifier:
             logical[pos] = 0
         for pos in soft_wrap_bytes:
             logical[pos] = ord('_')
-        logical_bytes = bytes(logical)
+        # `guard` means the previous slice ended mid-token, so byte 0 here is a
+        # continuation, not the start of a path. A sentinel in the logical view
+        # makes the regex's lookbehind reject a match there — without it, a URL
+        # flushed mid-way leaves the next chunk starting at `s://www.…`, which
+        # `_FULL_RE` reads as an `s:` drive path.
+        #
+        # The sentinel must be in the lookbehind's exclusion class `[\w./\\:\-]`
+        # yet unable to START a token, or the match simply begins at the
+        # sentinel and every offset goes negative. `:` is the only byte that is
+        # both: neither regex can open a token with it.
+        off = 1 if guard else 0
+        logical_bytes = (b':' * off) + bytes(logical)
 
         # Find any existing OSC 8 sequences — we strip them from the output
         # so our jbo:// hyperlinks don't nest with whatever the upstream
@@ -481,31 +547,35 @@ class Linkifier:
         out = bytearray()
         last = 0
         for m in self._regex.finditer(logical_bytes):
-            out.extend(slice_skipping_osc8(last, m.start()))
+            m_start, m_end = m.start() - off, m.end() - off
+            g1_start, g1_end = m.start(1) - off, m.end(1) - off
+            if m_start < 0:  # can't happen with a `:` sentinel; never slice by -1
+                continue
+            out.extend(slice_skipping_osc8(last, m_start))
             token_b = m.group(1)
             line_b = m.group(2)
-            match_orig = slice_skipping_osc8(m.start(), m.end())
+            match_orig = slice_skipping_osc8(m_start, m_end)
             if 0 in token_b:
                 # ANSI inside the token — don't try to linkify.
                 out.extend(match_orig)
             elif self._autodetect:
-                clean_b = clean_token_bytes(m.start(1), m.end(1))
+                clean_b = clean_token_bytes(g1_start, g1_end)
                 token = clean_b.decode('utf-8', errors='replace')
                 line_str = line_b.decode('ascii') if line_b else '1'
                 resolved = self._resolve_if_linkable(token)
                 if resolved is None:
                     out.extend(match_orig)
                 else:
-                    out.extend(emit_segmented_link(m.start(), m.end(),
+                    out.extend(emit_segmented_link(m_start, m_end,
                                                    self._build_url(resolved, line_str)))
             else:
                 # legacy mode: always emit, never stat, group(2) is mandatory.
-                clean_b = clean_token_bytes(m.start(1), m.end(1))
+                clean_b = clean_token_bytes(g1_start, g1_end)
                 resolved = clean_b.replace(b'\\', b'/').decode('utf-8', errors='replace')
                 line_str = line_b.decode('ascii')
-                out.extend(emit_segmented_link(m.start(), m.end(),
+                out.extend(emit_segmented_link(m_start, m_end,
                                                self._build_url(resolved, line_str)))
-            last = m.end()
+            last = m_end
         out.extend(slice_skipping_osc8(last, len(chunk)))
         return bytes(out)
 
@@ -572,9 +642,19 @@ def _run_pty(args, linkifier: Linkifier):
     try:
         while True:
             try:
-                rlist, _, _ = select.select([master, stdin_fd], [], [])
+                # Only ever block indefinitely with nothing held back. While
+                # bytes are buffered awaiting a possible path continuation,
+                # wake up and emit them instead of letting visible output wait
+                # on a chunk the child may never send.
+                rlist, _, _ = select.select(
+                    [master, stdin_fd], [], [],
+                    _PENDING_FLUSH_SEC if linkifier.pending else None)
             except (InterruptedError, ValueError):
                 break
+            if not rlist:
+                sys.stdout.buffer.write(linkifier.flush())
+                sys.stdout.buffer.flush()
+                continue
             if master in rlist:
                 try:
                     chunk = os.read(master, 65536)
@@ -611,6 +691,21 @@ def _run_winpty(args, linkifier: Linkifier):
     cols, rows = shutil.get_terminal_size((80, 24))
     proc = PtyProcess.spawn(args, dimensions=(rows, cols))
     done = threading.Event()
+    # `proc.read` blocks, so the idle flush needs its own thread — which makes
+    # the linkifier and stdout shared state between it and the reader.
+    io_lock = threading.Lock()
+
+    def _emit(produce):
+        with io_lock:
+            data = produce()
+            if data:
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+
+    def _poll_pending():
+        while not done.wait(_PENDING_FLUSH_SEC):
+            if linkifier.pending:      # re-checked under the lock by flush()
+                _emit(linkifier.flush)
 
     def _poll_resize():
         nonlocal cols, rows
@@ -630,8 +725,7 @@ def _run_winpty(args, linkifier: Linkifier):
                 if chunk:
                     if isinstance(chunk, str):
                         chunk = chunk.encode('utf-8', errors='replace')
-                    sys.stdout.buffer.write(linkifier.process(chunk))
-                    sys.stdout.buffer.flush()
+                    _emit(lambda c=chunk: linkifier.process(c))
             except EOFError:
                 break
             except Exception:
@@ -670,11 +764,12 @@ def _run_winpty(args, linkifier: Linkifier):
                     break
 
     for t in [threading.Thread(target=f, daemon=True)
-              for f in (_reader, _poll_resize, _writer)]:
+              for f in (_reader, _poll_resize, _poll_pending, _writer)]:
         t.start()
 
     done.wait()
-    tail = linkifier.flush()
+    with io_lock:
+        tail = linkifier.flush()
     if tail:
         sys.stdout.buffer.write(tail)
     sys.stdout.buffer.write(_build_teardown(linkifier.alt_screen_active,

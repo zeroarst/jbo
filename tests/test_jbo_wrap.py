@@ -5,8 +5,10 @@ The source file uses a hyphen (src/jbo-wrap.py), so we load it via importlib.
 import importlib.util
 import os
 import re
+import signal
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -828,6 +830,175 @@ class TestOsc8SafetyNet(_Fixture):
     def test_teardown_default_keeps_existing_callers_working(self):
         self.assertEqual(jbo_wrap._build_teardown(False),
                          jbo_wrap._build_teardown(False, False))
+
+
+class TestSynchronizedOutput(_Fixture):
+    """Claude Code brackets every frame in synchronized output (DECSET 2026):
+    `\\x1b[?2026h` … `\\x1b[?2026l`. The terminal buffers everything between
+    them and presents it atomically, so a frame whose closing ESU is held back
+    in the chunk buffer is never drawn at all — the screen freezes until some
+    later chunk happens to flush it.
+
+    Bytes captured from a real `claude` session (PTY, bracketed paste of a URL).
+    A URL is entirely path-token bytes, so `_find_safe_cut` wants to hold the
+    whole thing back when a PTY read boundary lands at its end.
+    """
+
+    BSU = b'\x1b[?2026h'
+    ESU = b'\x1b[?2026l'
+    # Real captured frame: cursor home, down 19 rows, draw the pasted URL.
+    FRAME = (b'\x1b[?2026h\x1b[?25l\x1b[H\r\x1b[2C\x1b[19B'
+             b'https://www.linkedin.com/jobs/view/4437537707/'
+             b'\x1b[24;1H\x1b[20;49H\x1b[?25h\x1b[?2026l')
+    SPLIT = FRAME.index(b'\x1b[24;1H')  # read boundary at the end of the URL
+
+    def assert_no_dangling_sync(self, link, emitted):
+        """A frame we opened must not still be open once we stop emitting."""
+        if link.pending and self.BSU in emitted:
+            self.assertGreater(emitted.rfind(self.ESU), emitted.rfind(self.BSU),
+                               'held bytes back with a sync frame left open')
+
+    def test_split_at_url_passes_the_partial_frame_straight_through(self):
+        # The ESU hasn't arrived yet, so we can't emit it — but we must not sit
+        # on the bytes we do have. Emitting them matches what an unwrapped
+        # terminal would have received at this instant.
+        link = self.link()
+        self.assertEqual(link.process(self.FRAME[:self.SPLIT]),
+                         self.FRAME[:self.SPLIT])
+
+    def test_split_at_url_shows_the_url(self):
+        link = self.link()
+        out = link.process(self.FRAME[:self.SPLIT])
+        self.assertIn(b'https://www.linkedin.com/jobs/view/4437537707/', out)
+
+    def test_split_at_url_holds_nothing_back(self):
+        link = self.link()
+        link.process(self.FRAME[:self.SPLIT])
+        self.assertFalse(link.pending)
+
+    def test_split_frame_round_trips_byte_for_byte(self):
+        link = self.link()
+        out = link.process(self.FRAME[:self.SPLIT]) + link.process(self.FRAME[self.SPLIT:])
+        out += link.flush()
+        self.assertEqual(out, self.FRAME)
+
+    def test_unsplit_frame_still_round_trips(self):
+        link = self.link()
+        self.assertEqual(link.process(self.FRAME) + link.flush(), self.FRAME)
+
+    def test_every_split_point_keeps_frame_closed(self):
+        for i in range(1, len(self.FRAME)):
+            link = self.link()
+            emitted = link.process(self.FRAME[:i])
+            self.assert_no_dangling_sync(link, emitted)
+
+    def test_every_split_point_round_trips(self):
+        for i in range(1, len(self.FRAME)):
+            link = self.link()
+            out = link.process(self.FRAME[:i]) + link.process(self.FRAME[i:])
+            self.assertEqual(out + link.flush(), self.FRAME, f'split at {i}')
+
+    def test_split_mid_url_invents_no_link(self):
+        """Forced mid-token flushes mean the next chunk can begin inside a URL.
+        `s://www.…` must not be read as a Windows `s:` drive path."""
+        for i in range(1, len(self.FRAME)):
+            link = self.link()
+            out = link.process(self.FRAME[:i]) + link.process(self.FRAME[i:])
+            self.assertNotIn(b'jbo://open', out + link.flush(), f'split at {i}')
+
+    def test_sync_state_tracked_across_chunks(self):
+        link = self.link()
+        self.assertFalse(link.sync_open)
+        link.process(b'\x1b[?2026h')
+        self.assertTrue(link.sync_open)
+        link.process(b'\x1b[?2026l')
+        self.assertFalse(link.sync_open)
+
+    def test_path_outside_sync_frame_still_buffers(self):
+        """The cross-chunk path hold-back must survive when no frame is open."""
+        link = self.link()
+        self.assertEqual(link.process(b'see src/fo'), b'see ')
+        self.assertTrue(link.pending)
+        out = link.process(b'o.js and stop')
+        self.assertIn(b'jbo://open', out)
+
+    def test_path_inside_sync_frame_still_linkifies_when_unsplit(self):
+        link = self.link()
+        out = link.process(self.BSU + b'edit src/foo.js now' + self.ESU)
+        self.assertIn(b'jbo://open', out)
+
+
+class TestPendingFlushContract(_Fixture):
+    """`pending` lets the PTY loop notice held-back bytes and flush them on an
+    idle timeout, so visible output never waits on a chunk that may not come."""
+
+    def test_pending_false_when_nothing_held(self):
+        link = self.link()
+        link.process(b'plain text\n')
+        self.assertFalse(link.pending)
+
+    def test_pending_true_while_holding_a_partial_path(self):
+        link = self.link()
+        link.process(b'see src/fo')
+        self.assertTrue(link.pending)
+
+    def test_flush_clears_pending(self):
+        link = self.link()
+        link.process(b'see src/fo')
+        link.flush()
+        self.assertFalse(link.pending)
+
+    def test_flush_emits_held_bytes(self):
+        link = self.link()
+        link.process(b'see src/fo')
+        self.assertEqual(link.flush(), b'src/fo')
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'needs Unix pty')
+class TestIdleFlushEndToEnd(unittest.TestCase):
+    """Drive the real `_run_pty` loop: output ending in path-token bytes must
+    reach the terminal on its own, not wait for the child's next write."""
+
+    def _run(self, script, wait):
+        import pty
+        import select
+        pid, master = pty.fork()
+        if pid == 0:
+            os.environ['SHELL'] = '/bin/sh'
+            os.execv(sys.executable, [sys.executable, str(_SRC), 'sh', '-c', script])
+            os._exit(1)
+        got = b''
+        deadline = time.monotonic() + wait
+        try:
+            while time.monotonic() < deadline:
+                r, _, _ = select.select([master], [], [], deadline - time.monotonic())
+                if not r:
+                    break
+                try:
+                    d = os.read(master, 65536)
+                except OSError:
+                    break
+                if not d:
+                    break
+                got += d
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        return got
+
+    def test_trailing_path_arrives_before_child_writes_again(self):
+        # The child prints a held-back token then goes quiet for 30s. We only
+        # wait 3s, so the bytes can only appear via the idle flush.
+        out = self._run('printf "see /etc/hostname"; sleep 30', wait=3)
+        self.assertIn(b'/etc/hostname', out)
+
+    def test_url_in_sync_frame_arrives_whole(self):
+        # The reported bug: a URL is all path-token bytes, so holding it back
+        # also holds the frame's closing ESU and the terminal draws nothing.
+        out = self._run(
+            r'printf "\033[?2026h\033[Hhttps://www.linkedin.com/jobs/view/44375/"'
+            r'; sleep 30', wait=3)
+        self.assertIn(b'https://www.linkedin.com/jobs/view/44375/', out)
 
 
 if __name__ == '__main__':
