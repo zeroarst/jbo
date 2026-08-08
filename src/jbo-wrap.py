@@ -118,6 +118,16 @@ _MAX_ESC_TAIL = 4096  # cap the incomplete-escape lookback; OSC 8 URLs get long
 # carrying params (`id=…`) as well as the empty-param form jbo-wrap emits.
 _OSC8_STATE_RE = re.compile(rb'\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)(?:\x07|\x1b\\)')
 
+# An OSC 8 introducer running off the end of the emitted bytes with no
+# terminator: the terminal is mid-parse and will finish the sequence from
+# whatever we send next, which `_linkify` can no longer recognise as an escape
+# and so can no longer strip. Only a sequence too long to hold back reaches the
+# terminal this way (over the buffer cap it has to drain or the stream
+# freezes). Whether it resolves to an open or a close isn't knowable yet, so
+# assume open: the teardown then closes a link that would otherwise underline
+# everything, and closing an unopened one is a no-op.
+_OSC8_OPEN_TAIL_RE = re.compile(rb'\x1b\]8[^\x07\x1b]*$')
+
 # DEC-private-mode disables written before exit so the outer terminal recovers
 # even if the wrapped child died without emitting its own teardown. The set
 # below is safe to emit unconditionally — disabling an un-enabled mode is a
@@ -205,12 +215,20 @@ class Linkifier:
         self.osc8_open = False
         self.sync_open = False
         self._tail_mid_token = False
+        self._held_escape_only = False
 
     @property
     def pending(self) -> bool:
-        """True while bytes are held back awaiting the next chunk. The PTY loop
-        watches this so it can `flush()` on an idle timeout."""
-        return bool(self._buffer)
+        """True while bytes the terminal could draw are held back awaiting the
+        next chunk. The PTY loop watches this so it can `flush()` on an idle
+        timeout.
+
+        A buffer holding nothing but a half-arrived escape sequence does not
+        count: `flush` won't release that (see there), so waking for it would
+        spin the loop at the idle interval for as long as the child stays
+        quiet — which for something like `wrangler login` is the whole browser
+        round-trip."""
+        return bool(self._buffer) and not self._held_escape_only
 
     def process(self, chunk: bytes) -> bytes:
         """Feed a chunk. Returns linkified bytes for the leading portion that
@@ -224,14 +242,6 @@ class Linkifier:
         ansi_positions = self._ansi_positions(data)
         soft_wrap_bytes = self._classify_soft_wraps(data)
         cut = self._find_safe_cut(data, ansi_positions, soft_wrap_bytes)
-        # Never emit a half-arrived escape sequence. Its terminator is what
-        # makes it recognisable as an escape at all, so emitting the front half
-        # means the OSC 8 stripping in `_linkify` misses it while stripping its
-        # partner that arrives intact later — leaving the terminal with a
-        # hyperlink opened and never closed, underlining everything after it.
-        esc = self._incomplete_escape_start(data, ansi_positions)
-        if esc is not None:
-            cut = min(cut, esc)
         # Holding bytes back is only safe between frames. If emitting just
         # `data[:cut]` would leave a synchronized-output frame open, the
         # terminal parks the whole frame off-screen until we send the ESU —
@@ -239,9 +249,31 @@ class Linkifier:
         # missed link is invisible; a stalled frame looks like a broken UI.
         if cut < len(data) and self._sync_state_after(self.sync_open, data[:cut]):
             cut = len(data)
+        # Never emit a half-arrived escape sequence. Its terminator is what
+        # makes it recognisable as an escape at all, so emitting the front half
+        # means the OSC 8 stripping in `_linkify` misses it while stripping its
+        # partner that arrives intact later — leaving the terminal with a
+        # hyperlink opened and never closed, underlining everything after it.
+        #
+        # This clamp gets the last word, after the sync override, because
+        # withholding a half-arrived sequence costs nothing on screen: every
+        # byte from its introducer to the end of `data` belongs to that
+        # sequence, so the terminal draws none of it either way. An open frame
+        # stays equally open whether we send the fragment or not — unlike a
+        # held-back run of visible text, which is what the override is for.
+        esc = self._incomplete_escape_start(data, ansi_positions)
+        if esc is not None:
+            cut = min(cut, esc)
+        # `_find_safe_cut` stops at the introducer (ESC is neither a token byte
+        # nor, while incomplete, an ANSI one), so `esc == cut` means the buffer
+        # is that fragment and nothing else — see `pending` and `flush`.
+        self._held_escape_only = esc == cut
         if cut == 0:
             if len(data) > _MAX_BUFFER:
+                # A sequence longer than the cap has to drain or the stream
+                # freezes; `_track_osc8` picks up the mid-parse opener instead.
                 self._buffer = b''
+                self._held_escape_only = False
                 return self._emit(data, ansi_positions, soft_wrap_bytes)
             self._buffer = data
             return b''
@@ -251,14 +283,33 @@ class Linkifier:
         return self._emit(data[:cut], leading_ansi, leading_soft)
 
     def flush(self) -> bytes:
-        """Drain any held-back bytes. Call when the wrapped process has exited."""
-        if not self._buffer:
+        """Drain held-back bytes. Called on the idle timeout, and once more
+        when the wrapped process has exited.
+
+        A trailing half-arrived escape sequence is the one thing kept back:
+        releasing it is exactly what `process` refused to do, and an idle child
+        is no reason to change that. It draws nothing until its terminator
+        arrives, so no visible output is stuck behind it — whereas emitting it
+        would put the terminal mid-parse on a sequence `_linkify` can no longer
+        recognise, and a hyperlink opened that way never gets closed. If the
+        child dies there, the fragment is dropped, which is what it deserves."""
+        if not self._buffer or self._held_escape_only:
             return b''
         data = self._buffer
-        self._buffer = b''
-        return self._emit(data,
-                          self._ansi_positions(data),
-                          self._classify_soft_wraps(data))
+        ansi = self._ansi_positions(data)
+        esc = self._incomplete_escape_start(data, ansi)
+        if esc == 0:
+            self._held_escape_only = True
+            return b''
+        soft = self._classify_soft_wraps(data)
+        if esc is None:
+            self._buffer = b''
+            return self._emit(data, ansi, soft)
+        self._buffer = data[esc:]
+        self._held_escape_only = True
+        return self._emit(data[:esc],
+                          {p for p in ansi if p < esc},
+                          {p for p in soft if p < esc})
 
     def _emit(self, data: bytes, ansi_positions: set, soft_wrap_bytes: set) -> bytes:
         """Linkify `data` and update terminal-state tracking. Every byte reaches
@@ -303,6 +354,10 @@ class Linkifier:
         depth. Read at teardown to close a link nothing else closed."""
         for m in _OSC8_STATE_RE.finditer(out):
             self.osc8_open = bool(m.group(1))
+        # An opener whose terminator never made it out (the overflow path) is
+        # still an opener as far as the terminal is concerned.
+        if _OSC8_OPEN_TAIL_RE.search(out):
+            self.osc8_open = True
 
     @staticmethod
     def _ansi_positions(data: bytes) -> set:

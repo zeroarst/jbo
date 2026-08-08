@@ -26,6 +26,14 @@ jbo_wrap = _load()
 Linkifier = jbo_wrap.Linkifier
 
 
+def _osc8_counts(out):
+    """(opens, closes) of OSC 8 sequences in `out`. A non-empty URI opens a
+    hyperlink, an empty one closes it."""
+    opens = len(re.findall(rb'\x1b\]8;[^;\x07\x1b]*;[^\x07\x1b]+(?:\x07|\x1b\\)', out))
+    closes = len(re.findall(rb'\x1b\]8;[^;\x07\x1b]*;(?:\x07|\x1b\\)', out))
+    return opens, closes
+
+
 class _Fixture(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -689,14 +697,6 @@ class TestSplitEscapeSequences(_Fixture):
     single `os.read(master, 65536)` far more often, so splits land mid-sequence.
     """
 
-    @staticmethod
-    def _osc8_counts(out):
-        """(opens, closes) of OSC 8 sequences in `out`. A non-empty URI opens a
-        hyperlink, an empty one closes it."""
-        opens = len(re.findall(rb'\x1b\]8;[^;\x07\x1b]*;[^\x07\x1b]+(?:\x07|\x1b\\)', out))
-        closes = len(re.findall(rb'\x1b\]8;[^;\x07\x1b]*;(?:\x07|\x1b\\)', out))
-        return opens, closes
-
     def _feed(self, *chunks):
         link = self.link()
         out = b''.join(link.process(c) for c in chunks) + link.flush()
@@ -706,7 +706,7 @@ class TestSplitEscapeSequences(_Fixture):
         # THE reported bug: everything after the split rendered underlined.
         _, out = self._feed(b'hello \x1b]8;;https://exa',
                             b'mple.com\x1b\\link text\x1b]8;;\x1b\\ tail\n')
-        opens, closes = self._osc8_counts(out)
+        opens, closes = _osc8_counts(out)
         self.assertEqual(opens, closes)
         # Upstream link is stripped whole, exactly as in the unsplit case.
         self.assertEqual(out, b'hello link text tail\n')
@@ -714,7 +714,7 @@ class TestSplitEscapeSequences(_Fixture):
     def test_osc8_split_immediately_after_introducer(self):
         _, out = self._feed(b'hello \x1b]',
                             b'8;;https://example.com\x1b\\link text\x1b]8;;\x1b\\ tail\n')
-        opens, closes = self._osc8_counts(out)
+        opens, closes = _osc8_counts(out)
         self.assertEqual(opens, closes)
         self.assertEqual(out, b'hello link text tail\n')
 
@@ -788,6 +788,87 @@ class TestSplitEscapeSequences(_Fixture):
         self.assertFalse(link.osc8_open)
         self.assertNotIn(b'\x1b]8;;',
                          jbo_wrap._build_teardown(False, link.osc8_open))
+
+
+class TestForcedEmitsKeepPartialEscapes(_Fixture):
+    """Regression: two later paths released a half-arrived escape sequence
+    anyway, reopening the dangling-hyperlink bug `TestSplitEscapeSequences`
+    covers for the ordinary chunk boundary.
+
+      - the idle `flush()`: a child that prints and then blocks — `npx wrangler
+        login` waits on the OAuth browser round-trip — leaves the timer to fire
+        with a half-arrived sequence still buffered, and `flush` emptied the
+        buffer unconditionally
+      - the synchronized-output override: Claude Code brackets every frame in
+        BSU…ESU, so `sync_open` holds for most of a redraw, and the override
+        ran after the escape clamp and undid it
+
+    Withholding a half-arrived sequence costs nothing on screen. Every byte
+    from its introducer to the end of the data belongs to that unterminated
+    sequence, so the terminal draws none of it either way — including when a
+    frame is open, which stays equally open whether we send the fragment or not.
+    """
+
+    BSU = b'\x1b[?2026h'
+    ESU = b'\x1b[?2026l'
+    # Upstream hyperlink split so the opener's ST lands in the second chunk.
+    HEAD = b'hello \x1b]8;;https://exa'
+    TAIL = b'mple.com\x1b\\link text\x1b]8;;\x1b\\ tail'
+
+    def test_idle_flush_keeps_a_half_arrived_opener_buffered(self):
+        link = self.link()
+        out = link.process(self.HEAD)
+        out += link.flush()                    # idle timeout, tail not here yet
+        out += link.process(self.TAIL + b'\n') + link.flush()
+        self.assertEqual(_osc8_counts(out), (0, 0))
+        self.assertEqual(out, b'hello link text tail\n')
+
+    def test_idle_flush_still_releases_the_visible_prefix(self):
+        link = self.link()
+        self.assertEqual(link.process(self.HEAD), b'hello ')
+        self.assertEqual(link.flush(), b'')
+
+    def test_pending_ignores_a_buffer_that_is_only_a_partial_escape(self):
+        # Otherwise the PTY loop wakes every 50ms to flush nothing at all for
+        # as long as the child stays quiet.
+        link = self.link()
+        link.process(self.HEAD)
+        self.assertFalse(link.pending)
+
+    def test_pending_still_true_for_a_half_arrived_path(self):
+        link = self.link()
+        link.process(b'see src/fo')
+        self.assertTrue(link.pending)
+
+    def test_open_sync_frame_keeps_a_half_arrived_opener_buffered(self):
+        link = self.link()
+        out = link.process(self.BSU + self.HEAD)
+        out += link.process(self.TAIL + self.ESU) + link.flush()
+        self.assertEqual(_osc8_counts(out), (0, 0))
+        self.assertEqual(out, self.BSU + b'hello link text tail' + self.ESU)
+
+    def test_open_sync_frame_still_releases_the_visible_prefix(self):
+        link = self.link()
+        self.assertEqual(link.process(self.BSU + self.HEAD),
+                         self.BSU + b'hello ')
+
+    def test_child_dying_mid_sequence_leaves_nothing_open(self):
+        # The fragment is dropped rather than emitted, so teardown has no
+        # hyperlink to close.
+        link = self.link()
+        link.process(self.BSU + self.HEAD)
+        self.assertEqual(link.flush(), b'')
+        self.assertFalse(link.osc8_open)
+
+    def test_overflow_emit_of_an_opener_is_caught_by_the_teardown(self):
+        # The one place a partial sequence still has to go out: a sequence
+        # longer than the buffer cap must drain or the stream freezes. The
+        # terminal is then mid-parse on an opener nothing will close, so the
+        # safety net has to notice it from the emitted tail alone.
+        link = self.link()
+        link.process(b'\x1b]8;;https://example.com/' + b'u' * (jbo_wrap._MAX_BUFFER + 100))
+        self.assertTrue(link.osc8_open)
+        self.assertIn(b'\x1b]8;;\x1b\\', jbo_wrap._build_teardown(False, link.osc8_open))
 
 
 class TestOsc8SafetyNet(_Fixture):
@@ -991,6 +1072,20 @@ class TestIdleFlushEndToEnd(unittest.TestCase):
         # wait 3s, so the bytes can only appear via the idle flush.
         out = self._run('printf "see /etc/hostname"; sleep 30', wait=3)
         self.assertIn(b'/etc/hostname', out)
+
+    def test_stalled_child_does_not_strand_a_hyperlink(self):
+        # The `wrangler login` shape: emit a hyperlink, then block long enough
+        # for the idle flush to fire with the opener still half-arrived, then
+        # finish it. Releasing the fragment left that opener unstrippable while
+        # the closer arriving intact later was still stripped — so the terminal
+        # kept a link open and underlined every cell drawn for the rest of the
+        # session.
+        out = self._run(
+            r'printf "\033]8;;https://exa"; sleep 0.5;'
+            r' printf "mple.com\033\\link\033]8;;\033\\ done\n"; sleep 30',
+            wait=3)
+        self.assertIn(b'link done', out)
+        self.assertEqual(_osc8_counts(out), (0, 0))
 
     def test_url_in_sync_frame_arrives_whole(self):
         # The reported bug: a URL is all path-token bytes, so holding it back
