@@ -3,3 +3,6 @@ dist/
 *.stackdump
 __pycache__/
 *.pyc
+
+# Names a local cloak profile — per-machine, never the same for two checkouts.
+.cloak
